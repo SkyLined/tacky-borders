@@ -148,6 +148,52 @@ fn run_daemon() {
     info!("exiting tacky-borders");
 }
 
+#[derive(Default)]
+struct ConfigReloadDispatch {
+    deferred: bool,
+    refresh_pending: bool,
+}
+
+enum ConfigReloadCompletion {
+    Idle,
+    RefreshBorders,
+    SpawnDeferred,
+}
+
+impl ConfigReloadDispatch {
+    fn request(&mut self, worker_active: bool) -> bool {
+        if worker_active {
+            self.deferred = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn after_completion(
+        &mut self,
+        reload_succeeded: bool,
+        shutting_down: bool,
+    ) -> ConfigReloadCompletion {
+        self.refresh_pending |= reload_succeeded;
+        if shutting_down {
+            self.deferred = false;
+            self.refresh_pending = false;
+            ConfigReloadCompletion::Idle
+        } else if std::mem::take(&mut self.deferred) {
+            ConfigReloadCompletion::SpawnDeferred
+        } else if std::mem::take(&mut self.refresh_pending) {
+            ConfigReloadCompletion::RefreshBorders
+        } else {
+            ConfigReloadCompletion::Idle
+        }
+    }
+
+    fn deferred_spawn_failed(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_pending)
+    }
+}
+
 fn run_host_loop(
     coordinator: &std::sync::Arc<tacky_borders::border_coordinator::BorderLifecycleCoordinator>,
     requests: &tacky_borders::HostRequests,
@@ -159,6 +205,7 @@ fn run_host_loop(
 ) {
     let mut stop_submitted = false;
     let mut wait_failed = false;
+    let mut config_reload_dispatch = ConfigReloadDispatch::default();
     let mut reconciler = tacky_borders::utils::WindowReconciler::default();
     #[cfg(test)]
     let silent_completion = tacky_borders::border_registry::BorderEvent::new(true).unwrap();
@@ -196,32 +243,6 @@ fn run_host_loop(
                 coordinator.request_shutdown();
                 stop_submitted = true;
             }
-            if config_reload
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-                && let Some(worker) = config_reload.take()
-            {
-                match worker.join() {
-                    Ok(Ok(())) if !shutting_down => {
-                        if receipts.len() < MAX_COORDINATOR_BATCH {
-                            match reload_borders() {
-                                Ok(receipt) => receipts.push((receipt, false)),
-                                Err(error) => {
-                                    error!("config reload border admission rejected: {error:#}")
-                                }
-                            }
-                        } else {
-                            error!("config reload border admission storage full");
-                        }
-                    }
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => error!("config reload failed: {error:#}"),
-                    Err(payload) => {
-                        tacky_borders::border_registry::discard_panic(payload);
-                        error!("config reload worker panicked");
-                    }
-                }
-            }
             if !shutting_down {
                 for _ in 0..MAX_COORDINATOR_BATCH {
                     let Ok(action) = requests.receiver.try_recv() else {
@@ -233,9 +254,8 @@ fn run_host_loop(
                     }
                     let submitted = match action {
                         HostAction::ReloadConfig => {
-                            if config_reload.is_some() {
-                                error!("config reload already in progress");
-                            } else {
+                            if config_reload_dispatch.request(config_reload.is_some()) {
+                                tacky_borders::config::begin_config_reload();
                                 match std::thread::Builder::new()
                                     .name("host-config-reload".into())
                                     .spawn(tacky_borders::config::Config::reload)
@@ -254,6 +274,45 @@ fn run_host_loop(
                         Ok(receipt) => receipts.push((receipt, false)),
                         Err(error) => error!("host operation rejected: {error:#}"),
                     }
+                }
+            }
+            if config_reload
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+                && let Some(worker) = config_reload.take()
+            {
+                let reload_succeeded = match worker.join() {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        error!("config reload failed: {error:#}");
+                        false
+                    }
+                    Err(payload) => {
+                        tacky_borders::border_registry::discard_panic(payload);
+                        error!("config reload worker panicked");
+                        false
+                    }
+                };
+                match config_reload_dispatch.after_completion(reload_succeeded, shutting_down) {
+                    ConfigReloadCompletion::SpawnDeferred => {
+                        tacky_borders::config::begin_config_reload();
+                        match std::thread::Builder::new()
+                            .name("host-config-reload".into())
+                            .spawn(tacky_borders::config::Config::reload)
+                        {
+                            Ok(worker) => config_reload = Some(worker),
+                            Err(error) => {
+                                error!("could not spawn deferred config reload worker: {error}");
+                                if config_reload_dispatch.deferred_spawn_failed() {
+                                    submit_config_reload_border_refresh(&mut receipts);
+                                }
+                            }
+                        }
+                    }
+                    ConfigReloadCompletion::RefreshBorders => {
+                        submit_config_reload_border_refresh(&mut receipts);
+                    }
+                    ConfigReloadCompletion::Idle => {}
                 }
             }
             for index in (0..receipts.len()).rev() {
@@ -281,6 +340,7 @@ fn run_host_loop(
             if coordinator.is_terminal() {
                 let result = coordinator.join_terminal();
                 if coordinator.has_joined() && config_reload.is_none() {
+                    tacky_borders::config::begin_config_reload();
                     result.log_if_err();
                     return true;
                 }
@@ -331,6 +391,17 @@ fn run_host_loop(
     }
     if !hwineventhook.0.is_null() {
         unsafe { UnhookWinEvent(hwineventhook) }.ok().log_if_err();
+    }
+}
+
+fn submit_config_reload_border_refresh(receipts: &mut Vec<(LifecycleReceipt, bool)>) {
+    if receipts.len() < MAX_COORDINATOR_BATCH {
+        match reload_borders() {
+            Ok(receipt) => receipts.push((receipt, false)),
+            Err(error) => error!("config reload border admission rejected: {error:#}"),
+        }
+    } else {
+        error!("config reload border admission storage full");
     }
 }
 
@@ -530,6 +601,60 @@ mod host_tests {
 
     pub(super) fn completion_is_suppressed() -> bool {
         SUPPRESS_COMPLETION.get()
+    }
+
+    #[test]
+    fn config_reload_dispatch_coalesces_active_requests() {
+        let mut dispatch = ConfigReloadDispatch::default();
+
+        assert!(dispatch.request(false));
+        assert!(!dispatch.request(true));
+        assert!(!dispatch.request(true));
+        assert!(matches!(
+            dispatch.after_completion(true, false),
+            ConfigReloadCompletion::SpawnDeferred
+        ));
+        assert!(matches!(
+            dispatch.after_completion(false, false),
+            ConfigReloadCompletion::RefreshBorders
+        ));
+
+        assert!(!dispatch.request(true));
+        assert!(matches!(
+            dispatch.after_completion(false, false),
+            ConfigReloadCompletion::SpawnDeferred
+        ));
+        assert!(!dispatch.deferred_spawn_failed());
+    }
+
+    #[test]
+    fn config_reload_dispatch_discards_deferred_start_on_shutdown() {
+        let mut dispatch = ConfigReloadDispatch::default();
+
+        assert!(!dispatch.request(true));
+        assert!(matches!(
+            dispatch.after_completion(true, true),
+            ConfigReloadCompletion::Idle
+        ));
+        assert!(matches!(
+            dispatch.after_completion(false, false),
+            ConfigReloadCompletion::Idle
+        ));
+    }
+
+    #[test]
+    fn config_reload_dispatch_retains_refresh_after_failed_deferred_reload() {
+        let mut dispatch = ConfigReloadDispatch::default();
+
+        assert!(!dispatch.request(true));
+        assert!(matches!(
+            dispatch.after_completion(true, false),
+            ConfigReloadCompletion::SpawnDeferred
+        ));
+        assert!(matches!(
+            dispatch.after_completion(false, false),
+            ConfigReloadCompletion::RefreshBorders
+        ));
     }
 
     #[test]

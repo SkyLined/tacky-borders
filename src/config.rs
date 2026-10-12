@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::{env, iter, ptr, slice, thread, time};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, HWND};
 use windows::Win32::Graphics::Dwm::{
     DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
 };
@@ -26,6 +28,7 @@ use windows::Win32::System::IO::CancelIoEx;
 use windows::core::PCWSTR;
 
 const DEFAULT_CONFIG: &str = include_str!("resources/config.yaml");
+static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// The config.yaml definition
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -448,6 +451,7 @@ impl Config {
 #[derive(Debug)]
 pub struct ConfigWatcher {
     dir_handle: OwnedHANDLE,
+    stop_requested: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
 }
 
@@ -493,6 +497,8 @@ impl ConfigWatcher {
             .into_string()
             .map_err(|_| anyhow!("could not convert config name for config watcher"))?;
 
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = stop_requested.clone();
         let thread_handle = thread::spawn(move || unsafe {
             debug!("entering config watcher thread");
 
@@ -503,6 +509,10 @@ impl ConfigWatcher {
             let mut bytes_returned = 0u32;
 
             loop {
+                if worker_stop_requested.load(Ordering::Acquire) {
+                    break;
+                }
+
                 if let Err(e) = ReadDirectoryChangesW(
                     dir_handle,
                     buffer.as_mut_ptr() as _,
@@ -513,16 +523,26 @@ impl ConfigWatcher {
                     None,
                     None,
                 ) {
-                    error!("could not check for changes in config dir: {e}");
+                    if !worker_stop_requested.load(Ordering::Acquire) {
+                        error!("could not check for changes in config dir: {e}");
+                    }
+                    break;
+                }
+
+                if worker_stop_requested.load(Ordering::Acquire) {
                     break;
                 }
 
                 Self::process_dir_change_notifs(&buffer, bytes_returned, &config_name, callback_fn);
 
+                if worker_stop_requested.load(Ordering::Acquire) {
+                    break;
+                }
+
                 // Prevent too many directory checks in quick succession
                 // NOTE: if any dir changes are made while the thread is asleep, the OS will hold
                 // the operations in queue, so we can immediately check them again after looping
-                thread::sleep(time::Duration::from_millis(debounce_time));
+                thread::park_timeout(time::Duration::from_millis(debounce_time));
             }
 
             debug!("exiting config watcher thread");
@@ -530,6 +550,7 @@ impl ConfigWatcher {
 
         Ok(Self {
             dir_handle,
+            stop_requested,
             thread_handle: Some(thread_handle),
         })
     }
@@ -569,27 +590,278 @@ impl ConfigWatcher {
 
 impl Drop for ConfigWatcher {
     fn drop(&mut self) {
-        // Cancel all pending I/O operations on the handle. This should make the worker thread
-        // automatically exit.
-        let cancel_res = unsafe { CancelIoEx(self.dir_handle.0, None) };
+        self.stop_requested.store(true, Ordering::Release);
 
-        match cancel_res {
-            Ok(()) => match self.thread_handle.take() {
-                Some(handle) => {
-                    if let Err(err) = handle.join() {
-                        error!("could not join config watcher thread handle: {err:?}");
-                    }
-                }
-                None => error!("could not take config watcher thread handle"),
-            },
-            Err(err) => error!(
-                "could not cancel i/o operations on {:?} for config watcher: {err:#}",
-                self.dir_handle.0
-            ),
+        let Some(handle) = self.thread_handle.take() else {
+            error!("could not take config watcher thread handle");
+            return;
+        };
+        handle.thread().unpark();
+
+        let cancellation_failed = match unsafe { CancelIoEx(self.dir_handle.0, None) } {
+            Ok(()) => false,
+            Err(err) if is_operation_not_found(&err) => false,
+            Err(err) => {
+                error!(
+                    "could not cancel i/o operations on {:?} for config watcher: {err:#}",
+                    self.dir_handle.0
+                );
+                true
+            }
+        };
+
+        join_or_reap_config_watcher(handle, cancellation_failed);
+    }
+}
+
+fn is_operation_not_found(error: &windows::core::Error) -> bool {
+    error.code() == ERROR_NOT_FOUND.to_hresult()
+}
+
+fn join_or_reap_config_watcher(handle: JoinHandle<()>, cancellation_failed: bool) {
+    if cancellation_failed || handle.thread().id() == thread::current().id() {
+        if let Err(err) = thread::Builder::new()
+            .name("config-watcher-reaper".into())
+            .spawn(move || log_config_watcher_join(handle.join()))
+        {
+            error!("could not spawn config watcher reaper: {err}");
         }
+    } else {
+        log_config_watcher_join(handle.join());
+    }
+}
+
+fn log_config_watcher_join(result: thread::Result<()>) {
+    if let Err(payload) = result {
+        crate::border_registry::discard_panic(payload);
+        error!("config watcher thread panicked");
     }
 }
 
 pub fn config_watcher_callback() {
-    crate::utils::LogIfErr::log_if_err(&crate::submit_host_action(crate::HostAction::ReloadConfig));
+    crate::utils::LogIfErr::log_if_err(&request_config_reload());
+}
+
+fn request_config_reload() -> anyhow::Result<()> {
+    request_config_reload_with(|| crate::submit_host_action(crate::HostAction::ReloadConfig))
+}
+
+fn request_config_reload_with(submit: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if CONFIG_RELOAD_PENDING.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+
+    if let Err(error) = submit() {
+        CONFIG_RELOAD_PENDING.store(false, Ordering::Release);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+pub fn begin_config_reload() {
+    CONFIG_RELOAD_PENDING.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+mod config_watcher_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    static CONFIG_RELOAD_TEST: Mutex<()> = Mutex::new(());
+    static CONFIG_WATCHER_TEST: Mutex<()> = Mutex::new(());
+    static CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CALLBACK_STARTED: AtomicBool = AtomicBool::new(false);
+    static CALLBACK_RELEASED: AtomicBool = AtomicBool::new(false);
+
+    fn unused_callback() {}
+
+    fn counting_callback() {
+        CALLBACK_COUNT.fetch_add(1, Ordering::Release);
+    }
+
+    fn blocking_callback() {
+        CALLBACK_STARTED.store(true, Ordering::Release);
+        while !CALLBACK_RELEASED.load(Ordering::Acquire) {
+            thread::park_timeout(time::Duration::from_millis(5));
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = time::Instant::now() + time::Duration::from_secs(2);
+        while !condition() && time::Instant::now() < deadline {
+            thread::sleep(time::Duration::from_millis(5));
+        }
+        assert!(condition());
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "tacky-borders-config-watcher-{name}-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn blocked_watcher_drop_cancels_and_joins_promptly() {
+        let _guard = CONFIG_WATCHER_TEST.lock().unwrap();
+        let directory = test_directory("blocked");
+        fs::create_dir_all(&directory).unwrap();
+        let watcher =
+            ConfigWatcher::new(directory.join("config.yaml"), 60_000, unused_callback).unwrap();
+
+        let started = time::Instant::now();
+        drop(watcher);
+
+        assert!(started.elapsed() < time::Duration::from_secs(2));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn debounce_wait_is_unparked_during_drop() {
+        let _guard = CONFIG_WATCHER_TEST.lock().unwrap();
+        CALLBACK_COUNT.store(0, Ordering::Release);
+        let directory = test_directory("debounce");
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.yaml");
+        let watcher = ConfigWatcher::new(config_path.clone(), 60_000, counting_callback).unwrap();
+
+        fs::write(config_path, "watch_config_changes: true\n").unwrap();
+        wait_until(|| CALLBACK_COUNT.load(Ordering::Acquire) == 1);
+
+        let started = time::Instant::now();
+        drop(watcher);
+
+        assert!(started.elapsed() < time::Duration::from_secs(2));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn callback_active_drop_waits_for_callback_then_joins() {
+        let _guard = CONFIG_WATCHER_TEST.lock().unwrap();
+        CALLBACK_STARTED.store(false, Ordering::Release);
+        CALLBACK_RELEASED.store(false, Ordering::Release);
+        let directory = test_directory("callback");
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.yaml");
+        let watcher = ConfigWatcher::new(config_path.clone(), 60_000, blocking_callback).unwrap();
+
+        fs::write(config_path, "watch_config_changes: true\n").unwrap();
+        wait_until(|| CALLBACK_STARTED.load(Ordering::Acquire));
+
+        let release_thread = thread::spawn(|| {
+            thread::sleep(time::Duration::from_millis(50));
+            CALLBACK_RELEASED.store(true, Ordering::Release);
+        });
+
+        let started = time::Instant::now();
+        drop(watcher);
+        let elapsed = started.elapsed();
+        release_thread.join().unwrap();
+
+        assert!(elapsed >= time::Duration::from_millis(40));
+        assert!(elapsed < time::Duration::from_secs(2));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn operation_not_found_is_expected_cancellation_race() {
+        let expected = windows::core::Error::from_hresult(ERROR_NOT_FOUND.to_hresult());
+        let unexpected = windows::core::Error::from_hresult(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult(),
+        );
+
+        assert!(is_operation_not_found(&expected));
+        assert!(!is_operation_not_found(&unexpected));
+    }
+
+    #[test]
+    fn current_thread_join_is_deferred_to_reaper() {
+        let (handle_sender, handle_receiver) = std::sync::mpsc::sync_channel(1);
+        let returned = Arc::new(AtomicBool::new(false));
+        let worker_returned = returned.clone();
+        let worker = thread::spawn(move || {
+            let own_handle = handle_receiver.recv().unwrap();
+            join_or_reap_config_watcher(own_handle, false);
+            worker_returned.store(true, Ordering::Release);
+        });
+
+        handle_sender.send(worker).unwrap();
+        wait_until(|| returned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_failure_defers_join_without_blocking_owner() {
+        let release = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_release = release.clone();
+        let worker_exited = exited.clone();
+        let worker = thread::spawn(move || {
+            while !worker_release.load(Ordering::Acquire) {
+                thread::park_timeout(time::Duration::from_millis(5));
+            }
+            worker_exited.store(true, Ordering::Release);
+        });
+
+        let started = time::Instant::now();
+        join_or_reap_config_watcher(worker, true);
+        assert!(started.elapsed() < time::Duration::from_secs(1));
+
+        release.store(true, Ordering::Release);
+        wait_until(|| exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_panic_is_consumed_by_join_logging() {
+        let worker = thread::spawn(|| panic!("config watcher test panic"));
+
+        join_or_reap_config_watcher(worker, false);
+    }
+
+    #[test]
+    fn config_reload_requests_coalesce_until_consumed() {
+        let _guard = CONFIG_RELOAD_TEST.lock().unwrap();
+        begin_config_reload();
+        let submissions = AtomicUsize::new(0);
+
+        request_config_reload_with(|| {
+            submissions.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        request_config_reload_with(|| {
+            submissions.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(submissions.load(Ordering::Relaxed), 1);
+
+        begin_config_reload();
+        request_config_reload_with(|| {
+            submissions.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(submissions.load(Ordering::Relaxed), 2);
+        begin_config_reload();
+    }
+
+    #[test]
+    fn rejected_config_reload_request_can_retry() {
+        let _guard = CONFIG_RELOAD_TEST.lock().unwrap();
+        begin_config_reload();
+
+        assert!(request_config_reload_with(|| Err(anyhow!("rejected"))).is_err());
+        let mut submitted = false;
+        request_config_reload_with(|| {
+            submitted = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(submitted);
+        begin_config_reload();
+    }
 }
