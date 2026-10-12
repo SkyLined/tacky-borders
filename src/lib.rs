@@ -17,6 +17,7 @@ pub mod effects;
 pub mod event_hook;
 pub mod iocp;
 pub mod ipc;
+mod ipc_security;
 pub mod komorebi;
 pub mod render_backend;
 pub mod sys_tray_icon;

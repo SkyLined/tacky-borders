@@ -101,7 +101,7 @@ fn test_socket_write_read() -> anyhow::Result<()> {
 
     fs::remove_file(&socket_path)?;
 
-    assert!(join_handle.is_finished());
+    join_handle.join().expect("socket writer thread panicked")?;
 
     let correct_output = unsafe { text.as_bytes_mut() };
 
