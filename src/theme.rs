@@ -15,8 +15,8 @@ use windows::core::PCWSTR;
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-use crate::reload_borders;
 use crate::utils::{OwnedHANDLE, OwnedHKEY, get_last_error};
+use crate::{HostAction, submit_host_action};
 
 const PERSONALIZE_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 const THEME_VALUE_NAME: &str = "SystemUsesLightTheme";
@@ -148,7 +148,9 @@ impl ThemeWatcher {
                     // Small delay for the system to finish the theme transition
                     thread::sleep(time::Duration::from_millis(200));
 
-                    reload_borders();
+                    crate::utils::LogIfErr::log_if_err(&submit_host_action(
+                        HostAction::ReloadBorders,
+                    ));
                 }
             }
 

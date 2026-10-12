@@ -4,9 +4,7 @@ use crate::effects::EffectsConfig;
 use crate::komorebi::KomorebiColorsConfig;
 use crate::render_backend::RenderBackendConfig;
 use crate::utils::{OwnedHANDLE, get_adjusted_radius, get_window_corner_preference};
-use crate::{
-    APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11, display_error_box, reload_borders,
-};
+use crate::{APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11, display_error_box};
 use anyhow::{Context, anyhow};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
@@ -157,7 +155,7 @@ impl WidthConfig {
     // TODO: Maybe rename this and other to_x methods to to_raw or smth idk
     /// Returns a DPI-adjusted raw width value
     pub fn to_width(&self, dpi: f32) -> i32 {
-        (self.0 as f32 * dpi / 96.0).round() as i32
+        (self.0 * dpi / 96.0).round() as i32
     }
 
     fn serde_default() -> Self {
@@ -341,7 +339,7 @@ impl Config {
         Ok(config_dir)
     }
 
-    pub fn reload() {
+    pub fn reload() -> anyhow::Result<()> {
         let new_config = match Self::create() {
             Ok(config) => {
                 BG_SERVICES.lock().unwrap().reload(&config);
@@ -374,7 +372,40 @@ impl Config {
                 Config::default()
             }
         };
-        *APP_STATE.config.write().unwrap() = new_config;
+        let mut sequence = APP_STATE
+            .appearance
+            .lock()
+            .map_err(|_| anyhow!("appearance gate poisoned"))?;
+        let revision = sequence.config_revision.checked_add(1).ok_or_else(|| {
+            APP_STATE
+                .border_registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .quarantine();
+            anyhow!("configuration revisions exhausted")
+        })?;
+        let command = sequence.next_command().ok_or_else(|| {
+            APP_STATE
+                .border_registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .quarantine();
+            anyhow!("appearance commands exhausted")
+        })?;
+        let mut config = APP_STATE
+            .config
+            .write()
+            .map_err(|_| anyhow!("configuration poisoned"))?;
+        *config = new_config;
+        sequence.config_revision = revision;
+        sequence.global_stamps = crate::border_updates::AppearanceStamps {
+            active: command,
+            inactive: command,
+            width: command,
+            offset: command,
+            radius: command,
+        };
+        Ok(())
     }
 
     pub fn is_config_watcher_enabled(&self) -> bool {
@@ -397,11 +428,11 @@ impl Config {
             || self.window_rules.iter().any(|rule| {
                 rule.active_color
                     .as_ref()
-                    .map_or(false, Self::is_color_theme_aware)
+                    .is_some_and(Self::is_color_theme_aware)
                     || rule
                         .inactive_color
                         .as_ref()
-                        .map_or(false, Self::is_color_theme_aware)
+                        .is_some_and(Self::is_color_theme_aware)
             })
     }
 
@@ -560,12 +591,5 @@ impl Drop for ConfigWatcher {
 }
 
 pub fn config_watcher_callback() {
-    let old_config = (*APP_STATE.config.read().unwrap()).clone();
-    Config::reload();
-    let new_config = APP_STATE.config.read().unwrap();
-
-    if old_config != *new_config {
-        info!("config.yaml has changed; reloading borders");
-        reload_borders();
-    }
+    crate::utils::LogIfErr::log_if_err(&crate::submit_host_action(crate::HostAction::ReloadConfig));
 }

@@ -175,17 +175,27 @@ impl Animations {
         &mut self,
         border_window: HWND,
         last_anim_time: &mut Option<time::Instant>,
-    ) {
+    ) -> Result<(), crate::anim_timer::AnimationTimerExit> {
         if self.timer.is_none() && (!self.active.is_empty() || !self.inactive.is_empty()) {
             let timer_duration = (1000.0 / self.fps as f32) as u64;
-            self.timer = Some(AnimationTimer::new(border_window, timer_duration));
+            self.timer = Some(AnimationTimer::new(
+                border_window,
+                time::Duration::from_millis(timer_duration),
+            )?);
 
             *last_anim_time = Some(time::Instant::now());
         }
+        Ok(())
     }
 
-    pub fn destroy_timer(&mut self) {
-        self.timer = None;
+    pub fn destroy_timer(&mut self) -> Result<(), crate::anim_timer::AnimationTimerExit> {
+        if let Some(mut timer) = self.timer.take() {
+            match timer.stop_and_join() {
+                crate::anim_timer::AnimationTimerExit::Stopped => {}
+                failure => return Err(failure.clone()),
+            }
+        }
+        Ok(())
     }
 
     pub fn update_fade_progress(&mut self, window_state: WindowState) {

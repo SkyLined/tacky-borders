@@ -5,16 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::HWND;
 
 use crate::APP_STATE;
 use crate::colors::ColorBrushConfig;
 use crate::config::serde_default_bool;
 use crate::iocp::{UnixStreamSink, write_to_unix_socket};
-use crate::utils::{
-    LogIfErr, WM_APP_KOMOREBI, get_foreground_window, is_window, post_message_w,
-    remove_file_if_exists,
-};
+use crate::utils::{LogIfErr, get_foreground_window, is_window, remove_file_if_exists};
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -255,11 +252,19 @@ impl KomorebiIntegration {
             }
         }
 
-        let new_focus_state = focus_state_mutex.lock().unwrap();
-
-        for (tracking, border) in APP_STATE.borders.lock().unwrap().iter() {
-            let previous_window_kind = previous_focus_state.get(tracking);
-            let new_window_kind = new_focus_state.get(tracking);
+        let new_focus_state = focus_state_mutex.lock().unwrap().clone();
+        let targets = crate::border_coordinator::try_registry(&APP_STATE.border_registry)
+            .map(|registry| {
+                registry
+                    .entries
+                    .values()
+                    .map(|entry| (entry.tracking.fingerprint.hwnd, entry.updates.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (tracking, updates) in targets {
+            let previous_window_kind = previous_focus_state.get(&tracking);
+            let new_window_kind = new_focus_state.get(&tracking);
 
             // Only post update messages when the window kind has actually changed
             if previous_window_kind != new_window_kind {
@@ -275,10 +280,11 @@ impl KomorebiIntegration {
                     continue;
                 }
 
-                let border_hwnd = HWND(*border as _);
-                post_message_w(Some(border_hwnd), WM_APP_KOMOREBI, WPARAM(0), LPARAM(0))
-                    .context("WM_APP_KOMOREBI")
-                    .log_if_err();
+                if !updates.control().is_stopped() {
+                    updates
+                        .hint(crate::border_runtime::WORK_KOMOREBI)
+                        .log_if_err();
+                }
             }
         }
     }

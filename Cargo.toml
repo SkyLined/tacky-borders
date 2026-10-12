@@ -51,5 +51,13 @@ features = [
 [dev-dependencies]
 serial_test = "3.5.0"
 
+[dev-dependencies.windows]
+version = "0.62.2"
+features = [
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Performance",
+  "Win32_System_ProcessStatus",
+]
+
 [build-dependencies]
 winres = "0.1.12"

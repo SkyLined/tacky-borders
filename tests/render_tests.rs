@@ -16,6 +16,24 @@ fn prepare_v2_render_backend() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_legacy_render_backend() -> anyhow::Result<()> {
+    register_border_window_class()?;
+    let border = WindowBorder::new(HWND::default())?;
+    let mut backend =
+        RenderBackendConfig::Legacy.to_render_backend(640, 480, border.border_window.0, false)?;
+    assert!(matches!(backend, RenderBackend::Legacy(_)));
+    backend.resize(640, 480, false)?;
+    assert_eq!(
+        backend.get_pixel_size()?,
+        D2D_SIZE_U {
+            width: 640,
+            height: 480
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn test_render_backend_v2_with_extra_bitmaps() -> anyhow::Result<()> {
     register_border_window_class()?;
     let border = WindowBorder::new(HWND::default())?;
@@ -73,10 +91,12 @@ fn test_border_drawer_update() -> anyhow::Result<()> {
     prepare_v2_render_backend()?;
 
     let mut border_drawer = BorderDrawer::default();
-    let mut config = BorderConfig::default();
-    config.width = WidthConfig::new(4.0);
-    config.offset = OffsetConfig::new(-1);
-    config.radius = RadiusConfig::Custom(8.0);
+    let config = BorderConfig {
+        width: WidthConfig::new(4.0),
+        offset: OffsetConfig::new(-1),
+        radius: RadiusConfig::Custom(8.0),
+        ..BorderConfig::default()
+    };
 
     border_drawer.configure_appearance(&config, 96, HWND::default());
     border_drawer.init(

@@ -6,7 +6,11 @@ pub mod anim_timer;
 pub mod animations;
 pub mod auto_start;
 pub mod border_config;
+pub mod border_coordinator;
 pub mod border_drawer;
+pub mod border_registry;
+pub mod border_runtime;
+pub mod border_updates;
 pub mod colors;
 pub mod config;
 pub mod effects;
@@ -21,25 +25,23 @@ pub mod utils;
 pub mod window_border;
 
 use anyhow::{Context, anyhow};
-use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
+use config::{Config, ConfigWatcher, config_watcher_callback};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
 use render_backend::RenderBackendConfig;
 use sp_log::{ColorChoice, CombinedLogger, FileLogger, LevelFilter, TermLogger, TerminalMode};
-use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
+use std::cell::{Cell, RefCell};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
 use utils::{
-    LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WM_APP_RECREATE_DRAWER,
-    WindowsCompatibleResult, WindowsContext, create_border_for_window, get_foreground_window,
-    get_last_error, get_window_rule, has_filtered_style, is_window_cloaked, is_window_top_level,
-    is_window_visible, post_message_w, send_notify_message_w,
+    LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WindowsCompatibleResult, WindowsContext,
+    get_foreground_window, get_last_error, post_message_w,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HMODULE, HWND, LPARAM, TRUE,
-    WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, FALSE, HANDLE, HMODULE, HWND, LPARAM, TRUE,
+    WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1CreateFactory, ID2D1Device, ID2D1Factory1,
@@ -60,15 +62,14 @@ use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, INFINITE, OpenThread, SetEvent, THREAD_SYNCHRONIZE,
-    WaitForMultipleObjects,
+    CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_MAX, EVENT_MIN, EnumWindows, GetWindowThreadProcessId, IDC_ARROW, IDNO, LoadCursorW,
-    MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
-    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_NCDESTROY, WNDCLASSEXW,
+    EVENT_MAX, EVENT_MIN, EnumWindows, IDC_ARROW, IDNO, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WNDCLASSEXW,
 };
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
@@ -92,11 +93,49 @@ pub static APP_STATE: LazyLock<AppState> = LazyLock::new(AppState::new);
 pub static BG_SERVICES: LazyLock<Mutex<BackgroundServices>> =
     LazyLock::new(|| Mutex::new(BackgroundServices::new(&APP_STATE.config.read().unwrap())));
 
+static HOST_SUBMISSION: OnceLock<(
+    std::sync::mpsc::SyncSender<HostAction>,
+    Arc<border_registry::BorderEvent>,
+)> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+pub enum HostAction {
+    ReloadConfig,
+    ReloadBorders,
+}
+
+pub struct HostRequests {
+    pub receiver: std::sync::mpsc::Receiver<HostAction>,
+    pub wake: Arc<border_registry::BorderEvent>,
+}
+
+pub fn initialize_host_requests() -> anyhow::Result<HostRequests> {
+    let wake = Arc::new(border_registry::BorderEvent::new(false)?);
+    let (sender, receiver) =
+        std::sync::mpsc::sync_channel(border_coordinator::MAX_COORDINATOR_BATCH);
+    HOST_SUBMISSION
+        .set((sender, wake.clone()))
+        .map_err(|_| anyhow!("host queue already initialized"))?;
+    Ok(HostRequests { receiver, wake })
+}
+
+pub fn submit_host_action(action: HostAction) -> anyhow::Result<()> {
+    let (sender, wake) = HOST_SUBMISSION
+        .get()
+        .ok_or_else(|| anyhow!("host not started"))?;
+    sender
+        .try_send(action)
+        .map_err(|error| anyhow!("host submission rejected: {error}"))?;
+    wake.signal()?;
+    Ok(())
+}
+
 pub struct AppState {
-    borders: Mutex<HashMap<isize, isize>>,
-    initial_windows: Mutex<Vec<isize>>,
+    border_registry: Arc<Mutex<border_registry::BorderRegistry>>,
+    lifecycle: Mutex<Option<Arc<border_coordinator::BorderLifecycleCoordinator>>>,
     active_window: Mutex<isize>,
     config: RwLock<Config>,
+    appearance: Mutex<border_updates::AppearanceSequencer>,
     render_factory: ID2D1Factory1,
     directx_devices: RwLock<Option<DirectXDevices>>,
 }
@@ -141,16 +180,62 @@ impl AppState {
         };
 
         AppState {
-            borders: Mutex::new(HashMap::new()),
-            initial_windows: Mutex::new(Vec::new()),
+            border_registry: Arc::new(Mutex::new(border_registry::BorderRegistry::default())),
+            lifecycle: Mutex::new(None),
             active_window: Mutex::new(active_window),
             config: RwLock::new(config),
+            appearance: Mutex::new(border_updates::AppearanceSequencer::default()),
             render_factory,
             directx_devices: RwLock::new(directx_devices_opt),
         }
     }
 
     // The following getter/setters are meant for use in testing
+    pub fn start_lifecycle(
+        &self,
+    ) -> anyhow::Result<Arc<border_coordinator::BorderLifecycleCoordinator>> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow!("lifecycle owner poisoned"))?;
+        if let Some(owner) = lifecycle.as_ref() {
+            return Ok(owner.clone());
+        }
+        let owner =
+            border_coordinator::BorderLifecycleCoordinator::start(self.border_registry.clone())?;
+        *lifecycle = Some(owner.clone());
+        Ok(owner)
+    }
+
+    pub(crate) fn lifecycle(
+        &self,
+    ) -> anyhow::Result<Arc<border_coordinator::BorderLifecycleCoordinator>> {
+        self.lifecycle
+            .try_lock()
+            .map_err(|_| anyhow!("lifecycle owner unavailable"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("lifecycle coordinator not started"))
+    }
+
+    pub(crate) fn border_windows(&self) -> Vec<(isize, isize)> {
+        let Some(registry) = border_coordinator::try_registry(&self.border_registry) else {
+            return Vec::new();
+        };
+        registry
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.phase == border_registry::BorderPhase::Running && !entry.control.is_stopped()
+            })
+            .filter_map(|entry| {
+                entry
+                    .border_hwnd
+                    .map(|hwnd| (entry.tracking.fingerprint.hwnd, hwnd))
+            })
+            .collect()
+    }
+
     pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, Config> {
         self.config.write().unwrap()
     }
@@ -347,24 +432,7 @@ impl DisplayAdaptersWatcher {
                     break;
                 }
 
-                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut()
-                    && let Err(err) = directx_devices.recreate_if_needed()
-                {
-                    error!("could not recreate directx devices if needed: {err:#}");
-                    break;
-                }
-
-                for hwnd_isize in APP_STATE.borders.lock().unwrap().values() {
-                    let border_hwnd = HWND(*hwnd_isize as _);
-                    post_message_w(
-                        Some(border_hwnd),
-                        WM_APP_RECREATE_DRAWER,
-                        WPARAM::default(),
-                        LPARAM::default(),
-                    )
-                    .context("WM_APP_RECREATE_RENDERER")
-                    .log_if_err();
-                }
+                utils::broadcast_border_work(border_runtime::WORK_DISPLAY);
             }
 
             debug!("exiting display adapters watcher thread");
@@ -408,6 +476,7 @@ impl Drop for DisplayAdaptersWatcher {
     }
 }
 
+#[derive(Clone)]
 pub struct DirectXDevices {
     dxgi_device: IDXGIDevice,
     d2d_device: ID2D1Device,
@@ -490,15 +559,6 @@ impl DirectXDevices {
             .windows_context("could not get curr_adapter_desc")?;
 
         Ok(curr_adapter_desc.AdapterLuid != new_adapter_desc.AdapterLuid)
-    }
-
-    pub fn recreate_if_needed(&mut self) -> WindowsCompatibleResult<()> {
-        if self.needs_recreation()? {
-            info!("recreating render devices");
-            *self = DirectXDevices::new(&APP_STATE.render_factory)?;
-        }
-
-        Ok(())
     }
 }
 
@@ -587,87 +647,18 @@ pub fn set_event_hook() -> HWINEVENTHOOK {
     }
 }
 
-pub fn create_borders_for_existing_windows() -> WindowsCompatibleResult<()> {
-    unsafe { EnumWindows(Some(create_borders_callback), LPARAM::default()) }?;
-    debug!("windows have been enumerated!");
-
-    Ok(())
+pub fn destroy_borders() -> anyhow::Result<border_coordinator::LifecycleReceipt> {
+    APP_STATE.lifecycle()?.request(
+        border_coordinator::OperationKind::Stop,
+        std::time::Duration::from_secs(10),
+    )
 }
 
-pub fn destroy_borders() {
-    // Copy the hashmap's values to prevent mutex deadlocks
-    let border_hwnds: Vec<HWND> = APP_STATE
-        .borders
-        .lock()
-        .unwrap()
-        .values()
-        .map(|hwnd_isize| HWND(*hwnd_isize as _))
-        .collect();
-
-    let thread_ids: HashSet<u32> = border_hwnds
-        .iter()
-        .filter_map(|hwnd| {
-            let thread_id = unsafe { GetWindowThreadProcessId(*hwnd, None) };
-            if thread_id != 0 {
-                Some(thread_id)
-            } else {
-                error!(
-                    "could not get thread id from {:?}: {:?}",
-                    hwnd,
-                    get_last_error()
-                );
-                None
-            }
-        })
-        .collect();
-
-    let thread_handles: Vec<HANDLE> = thread_ids
-        .into_iter()
-        .filter_map(
-            |thread_id| match unsafe { OpenThread(THREAD_SYNCHRONIZE, false, thread_id) } {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    error!("could not get thread handle from thread id {thread_id}: {err:#}");
-                    None
-                }
-            },
-        )
-        .collect();
-
-    // Tell the border windows to destroy themselves
-    for hwnd in border_hwnds.into_iter() {
-        send_notify_message_w(hwnd, WM_NCDESTROY, WPARAM::default(), LPARAM::default())
-            .with_context(|| format!("could not send notify WM_NCDESTROY to {hwnd:?}"))
-            .log_if_err();
-    }
-
-    let timeout_ms = 1000;
-    let wait_event = unsafe { WaitForMultipleObjects(&thread_handles, true, timeout_ms) };
-
-    let wait_object_start = WAIT_OBJECT_0.0;
-    let wait_object_end = WAIT_OBJECT_0.0 + (thread_handles.len() as u32);
-    let wait_object_range = wait_object_start..wait_object_end;
-
-    // If thread_handles is empty, WaitForMultipleObjects returns WAIT_FAILED since there's nothing
-    // to wait on. This is expected and safely ignored by the is_empty() check below.
-    if !thread_handles.is_empty() && !wait_object_range.contains(&wait_event.0) {
-        error!(
-            "failed to wait for all border threads to exit: {:?}",
-            get_last_error()
-        );
-    }
-
-    // Convert HANDLEs to OwnedHANDLEs so they automatically close when dropped
-    let _owned_handles: Vec<OwnedHANDLE> = thread_handles.into_iter().map(OwnedHANDLE).collect();
-
-    // NOTE: we will rely on each border thread to remove themselves from the hashmap, so we won't
-    // do any manual cleanup here
-}
-
-pub fn reload_borders() {
-    destroy_borders();
-    APP_STATE.initial_windows.lock().unwrap().clear();
-    create_borders_for_existing_windows().log_if_err();
+pub fn reload_borders() -> anyhow::Result<border_coordinator::LifecycleReceipt> {
+    APP_STATE.lifecycle()?.request(
+        border_coordinator::OperationKind::Reload,
+        std::time::Duration::from_secs(10),
+    )
 }
 
 pub fn display_error_box<T: std::fmt::Display>(
@@ -740,28 +731,187 @@ pub fn is_unwanted_instance() -> bool {
     })
 }
 
-unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    if is_window_top_level(_hwnd) {
-        // Only create borders for visible windows
-        if is_window_visible(_hwnd) && !is_window_cloaked(_hwnd) {
-            let window_rule = get_window_rule(_hwnd);
+thread_local! {
+    static ENUMERATION_STATE: RefCell<Option<Vec<isize>>> = const { RefCell::new(None) };
+    static ENUMERATION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static ENUMERATION_FAILED: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static ENUMERATION_PANIC: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static ENUMERATION_GROWTH_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
 
-            if window_rule.enabled == Some(EnableMode::Bool(false)) {
-                info!("border is disabled for {_hwnd:?}");
-            } else if window_rule.enabled == Some(EnableMode::Bool(true))
-                || !has_filtered_style(_hwnd)
-            {
-                create_border_for_window(_hwnd, window_rule);
+struct EnumerationGuard;
+
+impl Drop for EnumerationGuard {
+    fn drop(&mut self) {
+        let _ = ENUMERATION_STATE.try_with(|state| {
+            if let Ok(mut state) = state.try_borrow_mut() {
+                *state = None;
             }
-        }
+        });
+        let _ = ENUMERATION_ACTIVE.try_with(|active| active.set(false));
+    }
+}
 
-        // Add currently open windows to the intial windows list so we can keep track of them
-        APP_STATE
-            .initial_windows
-            .lock()
-            .unwrap()
-            .push(_hwnd.0 as isize);
+fn begin_enumeration() -> WindowsCompatibleResult<EnumerationGuard> {
+    if ENUMERATION_ACTIVE.replace(true) {
+        return Err(utils::WindowsCompatibleError::Standalone(
+            utils::StandaloneWindowsError::new(utils::T_E_REENTRANCY, "nested window enumeration"),
+        ));
+    }
+    let guard = EnumerationGuard;
+    ENUMERATION_FAILED.set(false);
+    ENUMERATION_STATE.with(|state| -> WindowsCompatibleResult<()> {
+        let mut state = state.try_borrow_mut().map_err(|_| {
+            utils::WindowsCompatibleError::Standalone(utils::StandaloneWindowsError::new(
+                utils::T_E_ERROR,
+                "enumeration state busy",
+            ))
+        })?;
+        *state = Some(Vec::new());
+        Ok(())
+    })?;
+    Ok(guard)
+}
+
+pub fn enumerate_tracking_windows() -> WindowsCompatibleResult<Vec<HWND>> {
+    let _guard = begin_enumeration()?;
+    let enumerated = unsafe { EnumWindows(Some(collect_windows_callback), LPARAM(0)) };
+    if ENUMERATION_FAILED.get() {
+        return Err(utils::WindowsCompatibleError::Standalone(
+            utils::StandaloneWindowsError::new(
+                utils::T_E_ERROR,
+                "window enumeration callback failed",
+            ),
+        ));
+    }
+    enumerated?;
+    let windows = ENUMERATION_STATE
+        .with(|state| state.borrow_mut().take())
+        .ok_or_else(|| {
+            utils::WindowsCompatibleError::Standalone(utils::StandaloneWindowsError::new(
+                utils::T_E_ERROR,
+                "window enumeration state missing",
+            ))
+        })?;
+    Ok(windows.into_iter().map(|hwnd| HWND(hwnd as _)).collect())
+}
+
+unsafe extern "system" fn collect_windows_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if ENUMERATION_PANIC.replace(false) {
+            panic!("injected enumeration failure");
+        }
+        if !ENUMERATION_ACTIVE.get() {
+            return false;
+        }
+        ENUMERATION_STATE.with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return false;
+            };
+            let Some(windows) = state.as_mut() else {
+                return false;
+            };
+            #[cfg(test)]
+            if ENUMERATION_GROWTH_FAILURE.replace(false) {
+                return false;
+            }
+            if windows.try_reserve(1).is_err() {
+                return false;
+            }
+            windows.push(hwnd.0 as isize);
+            true
+        })
+    }));
+    match collected {
+        Ok(true) => TRUE,
+        result => {
+            let _ = ENUMERATION_FAILED.try_with(|failed| failed.set(true));
+            if let Err(payload) = result {
+                border_registry::discard_panic(payload);
+            }
+            FALSE
+        }
+    }
+}
+
+#[cfg(test)]
+mod enumeration_tests {
+    use super::*;
+
+    #[test]
+    fn nested_enumeration_does_not_replace_outer_collection() {
+        let guard = begin_enumeration().unwrap();
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(1 as _), LPARAM(usize::MAX as _)) },
+            TRUE
+        );
+        assert!(begin_enumeration().is_err());
+        assert!(ENUMERATION_ACTIVE.get());
+        assert_eq!(
+            ENUMERATION_STATE.with(|state| state.borrow().as_ref().unwrap().clone()),
+            vec![1]
+        );
+        assert!(!ENUMERATION_FAILED.get());
+        drop(guard);
+        assert!(!ENUMERATION_ACTIVE.get());
     }
 
-    TRUE
+    #[test]
+    fn callback_panic_and_borrow_failure_reset_at_next_invocation() {
+        let guard = begin_enumeration().unwrap();
+        ENUMERATION_PANIC.set(true);
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(1 as _), LPARAM(1)) },
+            FALSE
+        );
+        assert!(ENUMERATION_FAILED.get());
+        drop(guard);
+        let guard = begin_enumeration().unwrap();
+        assert!(!ENUMERATION_FAILED.get());
+        ENUMERATION_STATE.with(|state| {
+            let _borrow = state.borrow_mut();
+            assert_eq!(
+                unsafe { collect_windows_callback(HWND(2 as _), LPARAM(1)) },
+                FALSE
+            );
+        });
+        assert!(ENUMERATION_FAILED.get());
+        drop(guard);
+        let _guard = begin_enumeration().unwrap();
+        assert!(!ENUMERATION_FAILED.get());
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(3 as _), LPARAM(1)) },
+            TRUE
+        );
+    }
+
+    #[test]
+    fn collection_growth_failure_discards_partial_enumeration_and_resets() {
+        let guard = begin_enumeration().unwrap();
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(1 as _), LPARAM(0)) },
+            TRUE
+        );
+        ENUMERATION_GROWTH_FAILURE.set(true);
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(2 as _), LPARAM(0)) },
+            FALSE
+        );
+        assert!(ENUMERATION_FAILED.get());
+        drop(guard);
+        assert!(ENUMERATION_STATE.with(|state| state.borrow().is_none()));
+        let _guard = begin_enumeration().unwrap();
+        assert!(!ENUMERATION_FAILED.get());
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(3 as _), LPARAM(0)) },
+            TRUE
+        );
+        assert_eq!(
+            ENUMERATION_STATE.with(|state| state.borrow().as_ref().unwrap().clone()),
+            vec![3]
+        );
+    }
 }
