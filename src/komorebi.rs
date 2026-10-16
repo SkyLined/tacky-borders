@@ -2,6 +2,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
@@ -43,6 +44,8 @@ pub struct KomorebiIntegration {
     // NOTE: in komorebi it's <Border HWND, WindowKind>, but here it's <Tracking HWND, WindowKind>
     pub focus_state: Arc<Mutex<HashMap<isize, WindowKind>>>,
     _stream_sink: UnixStreamSink,
+    subscription_stop: Arc<AtomicBool>,
+    subscription_thread: Option<JoinHandle<()>>,
 }
 
 impl KomorebiIntegration {
@@ -67,12 +70,16 @@ impl KomorebiIntegration {
             Self::spawn_komorebi_notification_handler(focus_state_clone, &tacky_socket_path)
                 .context("could not spawn komorebi notification handler")?;
 
-        let _ = Self::spawn_komorebi_subscribe_thread(komorebi_socket_path)
-            .context("could not spawn komorebi subscribe thread")?;
+        let subscription_stop = Arc::new(AtomicBool::new(false));
+        let subscription_thread =
+            Self::spawn_komorebi_subscribe_thread(komorebi_socket_path, subscription_stop.clone())
+                .context("could not spawn komorebi subscribe thread")?;
 
         Ok(Self {
             focus_state,
             _stream_sink: stream_sink,
+            subscription_stop,
+            subscription_thread: Some(subscription_thread),
         })
     }
 
@@ -102,24 +109,36 @@ impl KomorebiIntegration {
 
     fn spawn_komorebi_subscribe_thread(
         komorebi_socket_path: PathBuf,
+        stop: Arc<AtomicBool>,
     ) -> anyhow::Result<JoinHandle<()>> {
         let mut subscribe_message = {
             let enum_variant = SocketMessage::AddSubscriberSocket(Self::TACKY_SOCKET.to_string());
             serde_json::to_string(&enum_variant)?
         };
 
-        let join_handle = thread::spawn(move || {
+        Self::spawn_subscription_worker(stop, move || {
             let subscribe_bytes = unsafe { subscribe_message.as_bytes_mut() };
+            write_to_unix_socket(&komorebi_socket_path, subscribe_bytes)
+        })
+    }
 
-            while let Err(err) = write_to_unix_socket(&komorebi_socket_path, subscribe_bytes) {
-                // The write fails when komorebi isn't running which isn't a real issue, so we'll
-                // use debug instead of logging it as a full error
-                debug!("could not send subscribe-socket message to komorebi: {err:#}");
-                thread::sleep(Self::SUBSCRIBE_RETRY_INTERVAL);
-            }
-        });
-
-        Ok(join_handle)
+    fn spawn_subscription_worker(
+        stop: Arc<AtomicBool>,
+        mut subscribe: impl FnMut() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("komorebi-subscribe".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if let Err(error) = subscribe() {
+                        debug!("could not send subscribe-socket message to komorebi: {error:#}");
+                        thread::park_timeout(KomorebiIntegration::SUBSCRIBE_RETRY_INTERVAL);
+                    } else {
+                        break;
+                    }
+                }
+            })
+            .context("could not spawn komorebi subscribe worker")
     }
 
     fn get_komorebi_data_dir() -> anyhow::Result<PathBuf> {
@@ -287,5 +306,47 @@ impl KomorebiIntegration {
                 }
             }
         }
+    }
+}
+
+impl Drop for KomorebiIntegration {
+    fn drop(&mut self) {
+        self.subscription_stop.store(true, Ordering::Release);
+        if let Some(thread) = self.subscription_thread.take() {
+            thread.thread().unpark();
+            if let Err(payload) = thread.join() {
+                crate::border_registry::discard_panic(payload);
+                error!("komorebi subscribe worker panicked");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod subscription_worker_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    #[test]
+    fn stopping_retry_worker_wakes_and_joins_it() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (started, ready) = mpsc::channel();
+        let worker_stop = stop.clone();
+        let worker_attempts = attempts.clone();
+        let handle = KomorebiIntegration::spawn_subscription_worker(stop.clone(), move || {
+            worker_attempts.fetch_add(1, Ordering::Relaxed);
+            let _ = started.send(());
+            anyhow::bail!("injected unavailable server")
+        })
+        .unwrap();
+
+        ready.recv_timeout(time::Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        handle.thread().unpark();
+        handle.join().unwrap();
+        assert!(worker_stop.load(Ordering::Acquire));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 }

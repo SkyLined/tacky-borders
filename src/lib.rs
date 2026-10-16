@@ -32,6 +32,7 @@ use komorebi::KomorebiIntegration;
 use render_backend::RenderBackendConfig;
 use sp_log::{ColorChoice, CombinedLogger, FileLogger, LevelFilter, TermLogger, TerminalMode};
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
@@ -98,10 +99,26 @@ static HOST_SUBMISSION: OnceLock<(
     std::sync::mpsc::SyncSender<HostAction>,
     Arc<border_registry::BorderEvent>,
 )> = OnceLock::new();
+static IPC_RELOAD_SUBMISSIONS: OnceLock<Mutex<bool>> = OnceLock::new();
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReloadOrigin {
+    Watcher,
+    Tray,
+    Ipc,
+}
+
+pub struct IpcReloadResponse {
+    pub outcome: config::ReloadOutcome,
+    pub acknowledgement: std::sync::mpsc::SyncSender<()>,
+}
+
+#[derive(Clone)]
 pub enum HostAction {
-    ReloadConfig,
+    ReloadConfig {
+        origin: ReloadOrigin,
+        response: Option<std::sync::mpsc::SyncSender<IpcReloadResponse>>,
+    },
     ReloadBorders,
 }
 
@@ -117,6 +134,9 @@ pub fn initialize_host_requests() -> anyhow::Result<HostRequests> {
     HOST_SUBMISSION
         .set((sender, wake.clone()))
         .map_err(|_| anyhow!("host queue already initialized"))?;
+    IPC_RELOAD_SUBMISSIONS
+        .set(Mutex::new(true))
+        .map_err(|_| anyhow!("ipc reload submission gate already initialized"))?;
     Ok(HostRequests { receiver, wake })
 }
 
@@ -131,11 +151,36 @@ pub fn submit_host_action(action: HostAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn submit_ipc_reload(
+    response: std::sync::mpsc::SyncSender<IpcReloadResponse>,
+) -> anyhow::Result<()> {
+    let accepting = IPC_RELOAD_SUBMISSIONS
+        .get()
+        .ok_or_else(|| anyhow!("ipc reload gate not initialized"))?
+        .lock()
+        .map_err(|_| anyhow!("ipc reload gate poisoned"))?;
+    anyhow::ensure!(*accepting, "ipc server is being retired");
+    submit_host_action(HostAction::ReloadConfig {
+        origin: ReloadOrigin::Ipc,
+        response: Some(response),
+    })
+}
+
+pub fn set_ipc_reload_submissions(enabled: bool) -> anyhow::Result<()> {
+    *IPC_RELOAD_SUBMISSIONS
+        .get()
+        .ok_or_else(|| anyhow!("ipc reload gate not initialized"))?
+        .lock()
+        .map_err(|_| anyhow!("ipc reload gate poisoned"))? = enabled;
+    Ok(())
+}
+
 pub struct AppState {
     border_registry: Arc<Mutex<border_registry::BorderRegistry>>,
     lifecycle: Mutex<Option<Arc<border_coordinator::BorderLifecycleCoordinator>>>,
     active_window: Mutex<isize>,
     config: RwLock<RuntimeConfig>,
+    config_generation: AtomicU64,
     appearance: Mutex<border_updates::AppearanceSequencer>,
     render_factory: ID2D1Factory1,
     directx_devices: RwLock<Option<DirectXDevices>>,
@@ -185,6 +230,7 @@ impl AppState {
             lifecycle: Mutex::new(None),
             active_window: Mutex::new(active_window),
             config: RwLock::new(config),
+            config_generation: AtomicU64::new(0),
             appearance: Mutex::new(border_updates::AppearanceSequencer::default()),
             render_factory,
             directx_devices: RwLock::new(directx_devices_opt),
@@ -238,7 +284,10 @@ impl AppState {
     }
 
     pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, RuntimeConfig> {
-        self.config.write().unwrap()
+        let config = self.config.write().unwrap();
+        self.advance_config_generation()
+            .expect("configuration generations exhausted");
+        config
     }
 
     pub fn update_config(&self, update: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
@@ -248,8 +297,27 @@ impl AppState {
             .map_err(|_| anyhow!("configuration poisoned"))?;
         let mut source = config.source().clone();
         update(&mut source);
-        *config = RuntimeConfig::from_source(source)?;
+        let runtime = RuntimeConfig::from_source(source)?;
+        self.advance_config_generation()?;
+        *config = runtime;
         Ok(())
+    }
+
+    pub(crate) fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish_config_generation(&self, generation: u64) {
+        self.config_generation.store(generation, Ordering::Release);
+    }
+
+    pub(crate) fn advance_config_generation(&self) -> anyhow::Result<u64> {
+        self.config_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|generation| generation + 1)
+            .map_err(|_| anyhow!("configuration generations exhausted"))
     }
 
     pub fn get_render_factory(&self) -> &ID2D1Factory1 {
@@ -273,6 +341,67 @@ pub struct BackgroundServices {
 
 unsafe impl Send for BackgroundServices {}
 unsafe impl Sync for BackgroundServices {}
+
+enum ServiceTransition<T> {
+    Keep,
+    Start(T),
+    Stop,
+}
+
+pub(crate) struct BackgroundServicePlan {
+    config_watcher: ServiceTransition<ConfigWatcher>,
+    komorebi_integration: ServiceTransition<KomorebiIntegration>,
+    theme_watcher: ServiceTransition<ThemeWatcher>,
+    ipc_server: ServiceTransition<IpcServer>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServicePresence {
+    config_watcher: bool,
+    komorebi_integration: bool,
+    theme_watcher: bool,
+    ipc_server: bool,
+}
+
+#[derive(Default)]
+pub struct RetiredServices {
+    config_watcher: Option<ConfigWatcher>,
+    komorebi_integration: Option<KomorebiIntegration>,
+    theme_watcher: Option<ThemeWatcher>,
+    ipc_server: Option<IpcServer>,
+}
+
+#[derive(Default)]
+pub struct RetiredResources {
+    pub(crate) services: RetiredServices,
+    pub(crate) directx_devices: Option<DirectXDevices>,
+}
+
+impl RetiredResources {
+    pub fn retires_ipc_server(&self) -> bool {
+        self.services.retires_ipc_server()
+    }
+
+    pub fn retire(self) {
+        self.services.retire();
+        drop(self.directx_devices);
+    }
+}
+
+impl RetiredServices {
+    pub(crate) fn retires_ipc_server(&self) -> bool {
+        self.ipc_server.is_some()
+    }
+
+    pub fn retire(self) {
+        drop((
+            self.config_watcher,
+            self.komorebi_integration,
+            self.theme_watcher,
+            self.ipc_server,
+        ));
+    }
+}
 
 impl BackgroundServices {
     fn new(config: &Config) -> Self {
@@ -325,61 +454,101 @@ impl BackgroundServices {
         }
     }
 
-    pub fn reload(&mut self, config: &Config) {
-        // We take and destructure so that the compiler complains if we add a new
-        // struct field and forget to add it to the reload logic
-        let Self {
-            mut config_watcher,
-            mut komorebi_integration,
-            mut theme_watcher,
-            mut ipc_server,
-            display_adapters_watcher,
-        } = std::mem::take(self);
-
-        if config.is_config_watcher_enabled() && config_watcher.is_none() {
-            config_watcher = create_config_watcher()
-                .inspect_err(|err| error!("could not start config watcher: {err:#}"))
-                .ok();
-        } else if !config.is_config_watcher_enabled() && config_watcher.is_some() {
-            config_watcher = None;
+    pub(crate) fn presence(&self) -> ServicePresence {
+        ServicePresence {
+            config_watcher: self.config_watcher.is_some(),
+            komorebi_integration: self.komorebi_integration.is_some(),
+            theme_watcher: self.theme_watcher.is_some(),
+            ipc_server: self.ipc_server.is_some(),
         }
+    }
 
-        if config.is_komorebi_integration_enabled() && komorebi_integration.is_none() {
-            komorebi_integration = KomorebiIntegration::new()
-                .inspect_err(|err| error!("could not start komorebi integration: {err:#}"))
-                .ok();
-        } else if !config.is_komorebi_integration_enabled() && komorebi_integration.is_some() {
-            komorebi_integration = None;
-        }
+    pub fn ipc_server_active(&self) -> bool {
+        self.ipc_server.is_some()
+    }
 
-        if config.is_theme_aware_enabled() && theme_watcher.is_none() {
-            theme_watcher = ThemeWatcher::new()
-                .inspect_err(|err| error!("could not start theme watcher: {err:#}"))
-                .ok();
-        } else if !config.is_theme_aware_enabled() && theme_watcher.is_some() {
-            theme_watcher = None;
-        }
+    pub(crate) fn prepare_reload(
+        presence: ServicePresence,
+        config: &Config,
+    ) -> anyhow::Result<BackgroundServicePlan> {
+        Ok(BackgroundServicePlan {
+            config_watcher: Self::prepare_service(
+                presence.config_watcher,
+                config.is_config_watcher_enabled(),
+                create_config_watcher,
+            )
+            .map_err(|error| error.context("prepare config watcher"))?,
+            komorebi_integration: Self::prepare_service(
+                presence.komorebi_integration,
+                config.is_komorebi_integration_enabled(),
+                KomorebiIntegration::new,
+            )
+            .map_err(|error| error.context("prepare komorebi integration"))?,
+            theme_watcher: Self::prepare_service(
+                presence.theme_watcher,
+                config.is_theme_aware_enabled(),
+                ThemeWatcher::new,
+            )
+            .map_err(|error| error.context("prepare theme watcher"))?,
+            ipc_server: Self::prepare_service(
+                presence.ipc_server,
+                config.is_ipc_server_enabled(),
+                || ipc::socket_path().and_then(|path| IpcServer::new(&path)),
+            )
+            .map_err(|error| error.context("prepare ipc server"))?,
+        })
+    }
 
-        if config.is_ipc_server_enabled() && ipc_server.is_none() {
-            ipc_server = ipc::socket_path()
-                .and_then(|path| IpcServer::new(&path))
-                .inspect_err(|err| error!("could not start ipc server: {err:#}"))
-                .ok();
-        } else if !config.is_ipc_server_enabled() && ipc_server.is_some() {
-            ipc_server = None;
-        }
+    pub(crate) fn services_satisfy(presence: ServicePresence, config: &Config) -> bool {
+        presence.config_watcher == config.is_config_watcher_enabled()
+            && presence.komorebi_integration == config.is_komorebi_integration_enabled()
+            && presence.theme_watcher == config.is_theme_aware_enabled()
+            && presence.ipc_server == config.is_ipc_server_enabled()
+    }
 
-        *self = Self {
-            config_watcher,
-            komorebi_integration,
-            theme_watcher,
-            ipc_server,
-            display_adapters_watcher,
+    pub(crate) fn commit_reload(&mut self, plan: BackgroundServicePlan) -> RetiredServices {
+        RetiredServices {
+            config_watcher: Self::apply_service_transition(
+                &mut self.config_watcher,
+                plan.config_watcher,
+            ),
+            komorebi_integration: Self::apply_service_transition(
+                &mut self.komorebi_integration,
+                plan.komorebi_integration,
+            ),
+            theme_watcher: Self::apply_service_transition(
+                &mut self.theme_watcher,
+                plan.theme_watcher,
+            ),
+            ipc_server: Self::apply_service_transition(&mut self.ipc_server, plan.ipc_server),
         }
     }
 
     pub fn shutdown(&mut self) {
         *self = Self::default();
+    }
+
+    fn prepare_service<T>(
+        active: bool,
+        desired: bool,
+        create: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<ServiceTransition<T>> {
+        match (active, desired) {
+            (true, true) | (false, false) => Ok(ServiceTransition::Keep),
+            (true, false) => Ok(ServiceTransition::Stop),
+            (false, true) => create().map(ServiceTransition::Start),
+        }
+    }
+
+    fn apply_service_transition<T>(
+        current: &mut Option<T>,
+        transition: ServiceTransition<T>,
+    ) -> Option<T> {
+        match transition {
+            ServiceTransition::Keep => None,
+            ServiceTransition::Start(service) => current.replace(service),
+            ServiceTransition::Stop => current.take(),
+        }
     }
 }
 
@@ -846,6 +1015,76 @@ unsafe extern "system" fn collect_windows_callback(hwnd: HWND, _lparam: LPARAM) 
             }
             FALSE
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_service_plan_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn service_plan_reuses_active_and_stops_only_at_commit() {
+        let mut active = Some(String::from("running"));
+        let keep = BackgroundServices::prepare_service(active.is_some(), true, || {
+            panic!("an active service must be reused")
+        })
+        .unwrap();
+        assert!(matches!(&keep, ServiceTransition::Keep));
+        assert!(BackgroundServices::apply_service_transition(&mut active, keep).is_none());
+        assert_eq!(active.as_deref(), Some("running"));
+
+        let stop = BackgroundServices::prepare_service(active.is_some(), false, || {
+            panic!("a stopping service must not be recreated")
+        })
+        .unwrap();
+        assert_eq!(active.as_deref(), Some("running"));
+        let retired = BackgroundServices::apply_service_transition(&mut active, stop);
+        assert_eq!(retired.as_deref(), Some("running"));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn failed_later_preparation_drops_earlier_prepared_service() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let prepared =
+            BackgroundServices::prepare_service(false, true, || Ok(DropProbe(drops.clone())))
+                .unwrap();
+        let later: anyhow::Result<ServiceTransition<()>> =
+            BackgroundServices::prepare_service(false, true, || {
+                anyhow::bail!("injected start failure")
+            });
+        assert!(later.is_err());
+        drop(prepared);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn service_plan_starts_only_when_target_is_enabled_and_absent() {
+        let calls = AtomicUsize::new(0);
+        let start = BackgroundServices::prepare_service(false, true, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(42)
+        })
+        .unwrap();
+        assert!(matches!(start, ServiceTransition::Start(42)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let keep = BackgroundServices::prepare_service(false, false, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(7)
+        })
+        .unwrap();
+        assert!(matches!(keep, ServiceTransition::Keep));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
 

@@ -4,17 +4,18 @@ use crate::effects::EffectsConfig;
 use crate::komorebi::KomorebiColorsConfig;
 use crate::render_backend::RenderBackendConfig;
 use crate::utils::{OwnedHANDLE, get_adjusted_radius, get_window_corner_preference};
-use crate::{APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11, display_error_box};
+use crate::{APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11};
 use anyhow::{Context, anyhow};
 use dirs::home_dir;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder};
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::{env, iter, ptr, slice, thread, time};
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, HWND};
@@ -30,7 +31,11 @@ use windows::Win32::System::IO::CancelIoEx;
 use windows::core::PCWSTR;
 
 const DEFAULT_CONFIG: &str = include_str!("resources/config.yaml");
-static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
+const CONFIG_RELOAD_IDLE: u8 = 0;
+const CONFIG_RELOAD_PENDING: u8 = 1;
+const CONFIG_RELOAD_DIRTY: u8 = 2;
+static CONFIG_RELOAD_STATE: AtomicU8 = AtomicU8::new(CONFIG_RELOAD_IDLE);
+static LAST_WATCHER_REJECTION: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
 /// The config.yaml definition
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -195,10 +200,33 @@ enum WindowMatcher {
     Regex(Regex),
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ReloadStage {
+    Read,
+    Parse,
+    Validate,
+    PrepareServices,
+    PrepareRenderer,
+    StalePlan,
+    Commit,
+}
+
 #[derive(Debug)]
 pub enum ReloadOutcome {
-    Applied { changed: bool },
-    Rejected(anyhow::Error),
+    Applied {
+        changed: bool,
+        generation: u64,
+    },
+    Rejected {
+        stage: ReloadStage,
+        error: anyhow::Error,
+        report: bool,
+    },
+}
+
+pub struct ReloadCompletion {
+    pub outcome: ReloadOutcome,
+    pub retired: crate::RetiredResources,
 }
 
 impl RuntimeConfig {
@@ -489,77 +517,254 @@ impl Config {
         Ok(config_dir)
     }
 
-    pub fn reload() -> ReloadOutcome {
-        let new_config = match RuntimeConfig::load() {
-            Ok(config) => config,
-            Err(error) => return reject_reload(error),
-        };
-        let changed = match APP_STATE.config.read() {
-            Ok(config) => *config != new_config,
-            Err(_) => return reject_reload(anyhow!("configuration poisoned")),
-        };
-        if !changed {
-            return ReloadOutcome::Applied { changed: false };
-        }
-
-        let result = (|| -> anyhow::Result<()> {
-            let mut directx_devices_opt = APP_STATE
-                .directx_devices
-                .write()
-                .map_err(|_| anyhow!("render device state poisoned"))?;
-
-            if new_config.render_backend == RenderBackendConfig::V2 && directx_devices_opt.is_none()
-            {
-                *directx_devices_opt = Some(DirectXDevices::new(&APP_STATE.render_factory)?);
-            } else if new_config.render_backend == RenderBackendConfig::Legacy
-                && directx_devices_opt.is_some()
-            {
-                *directx_devices_opt = None;
+    pub fn reload(origin: crate::ReloadOrigin) -> ReloadCompletion {
+        let contents = match Self::read_contents() {
+            Ok(contents) => contents,
+            Err(error) => {
+                return reject_reload(
+                    ReloadStage::Read,
+                    error,
+                    origin,
+                    rejection_fingerprint("", ReloadStage::Read, "read failed"),
+                );
             }
-            drop(directx_devices_opt);
-
-            BG_SERVICES.lock().unwrap().reload(new_config.source());
-
-            let mut sequence = APP_STATE
-                .appearance
-                .lock()
-                .map_err(|_| anyhow!("appearance gate poisoned"))?;
-            let revision = sequence.config_revision.checked_add(1).ok_or_else(|| {
-                APP_STATE
-                    .border_registry
+        };
+        let source = match serde_yaml_ng::from_str::<Config>(&contents) {
+            Ok(source) => source,
+            Err(error) => {
+                return reject_reload(
+                    ReloadStage::Parse,
+                    anyhow::Error::new(error),
+                    origin,
+                    rejection_fingerprint(&contents, ReloadStage::Parse, "parse failed"),
+                );
+            }
+        };
+        let candidate = match RuntimeConfig::from_source(source) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return reject_reload(
+                    ReloadStage::Validate,
+                    error,
+                    origin,
+                    rejection_fingerprint(&contents, ReloadStage::Validate, "validation failed"),
+                );
+            }
+        };
+        for attempt in 0..=1 {
+            let snapshot = (|| -> anyhow::Result<_> {
+                let active = APP_STATE
+                    .config
+                    .read()
+                    .map_err(|_| anyhow!("configuration poisoned"))?;
+                let generation = APP_STATE.config_generation();
+                let services = BG_SERVICES
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .quarantine();
-                anyhow!("configuration revisions exhausted")
-            })?;
-            let command = sequence.next_command().ok_or_else(|| {
-                APP_STATE
-                    .border_registry
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .quarantine();
-                anyhow!("appearance commands exhausted")
-            })?;
-            let mut config = APP_STATE
-                .config
-                .write()
-                .map_err(|_| anyhow!("configuration poisoned"))?;
-            *config = new_config;
-            sequence.config_revision = revision;
-            sequence.global_stamps = crate::border_updates::AppearanceStamps {
-                active: command,
-                inactive: command,
-                width: command,
-                offset: command,
-                radius: command,
+                    .map_err(|_| anyhow!("background services poisoned"))?
+                    .presence();
+                let directx_present = APP_STATE
+                    .directx_devices
+                    .read()
+                    .map_err(|_| anyhow!("render device state poisoned"))?
+                    .is_some();
+                Ok((active.clone(), generation, services, directx_present))
+            })();
+            let (active, base_generation, service_presence, directx_present) = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return reject_reload(
+                        ReloadStage::Commit,
+                        error,
+                        origin,
+                        rejection_fingerprint(
+                            &contents,
+                            ReloadStage::Commit,
+                            "could not snapshot active state",
+                        ),
+                    );
+                }
             };
-            Ok(())
-        })();
 
-        match result {
-            Ok(()) => ReloadOutcome::Applied { changed: true },
-            Err(error) => reject_reload(error),
+            let renderer_needed = candidate.render_backend == RenderBackendConfig::V2;
+            let services_satisfied =
+                crate::BackgroundServices::services_satisfy(service_presence, candidate.source());
+            if active == candidate && services_satisfied && directx_present == renderer_needed {
+                clear_watcher_rejection();
+                return ReloadCompletion {
+                    outcome: ReloadOutcome::Applied {
+                        changed: false,
+                        generation: base_generation,
+                    },
+                    retired: crate::RetiredResources {
+                        services: crate::RetiredServices::default(),
+                        directx_devices: None,
+                    },
+                };
+            }
+
+            let service_plan = match crate::BackgroundServices::prepare_reload(
+                service_presence,
+                candidate.source(),
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return reject_reload(
+                        ReloadStage::PrepareServices,
+                        error.context("prepare background services"),
+                        origin,
+                        rejection_fingerprint(
+                            &contents,
+                            ReloadStage::PrepareServices,
+                            "service preparation failed",
+                        ),
+                    );
+                }
+            };
+            let renderer_plan =
+                match prepare_renderer_plan(renderer_needed, directx_present, || {
+                    DirectXDevices::new(&APP_STATE.render_factory).map_err(anyhow::Error::from)
+                }) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        drop(service_plan);
+                        return reject_reload(
+                            ReloadStage::PrepareRenderer,
+                            error.context("prepare DirectX devices"),
+                            origin,
+                            rejection_fingerprint(
+                                &contents,
+                                ReloadStage::PrepareRenderer,
+                                "renderer preparation failed",
+                            ),
+                        );
+                    }
+                };
+            let next_generation = match base_generation.checked_add(1) {
+                Some(generation) => generation,
+                None => {
+                    return reject_reload(
+                        ReloadStage::Commit,
+                        anyhow!("configuration generations exhausted"),
+                        origin,
+                        rejection_fingerprint(
+                            &contents,
+                            ReloadStage::Commit,
+                            "configuration generations exhausted",
+                        ),
+                    );
+                }
+            };
+
+            let commit = (|| -> Result<_, ReloadCommitError> {
+                // Appearance mutations acquire these locks in the same order.
+                let mut sequence = APP_STATE
+                    .appearance
+                    .lock()
+                    .map_err(|_| anyhow!("appearance gate poisoned"))?;
+                let mut config = APP_STATE
+                    .config
+                    .write()
+                    .map_err(|_| anyhow!("configuration poisoned"))?;
+                let mut services = BG_SERVICES
+                    .lock()
+                    .map_err(|_| anyhow!("background services poisoned"))?;
+                let mut devices = APP_STATE
+                    .directx_devices
+                    .write()
+                    .map_err(|_| anyhow!("render device state poisoned"))?;
+
+                if APP_STATE.config_generation() != base_generation
+                    || *config != active
+                    || services.presence() != service_presence
+                    || devices.is_some() != directx_present
+                {
+                    drop(devices);
+                    drop(services);
+                    drop(config);
+                    drop(sequence);
+                    return Err(ReloadCommitError::Stale);
+                }
+
+                let revision = sequence
+                    .config_revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("configuration revisions exhausted"))?;
+                let command = sequence
+                    .next_command()
+                    .ok_or_else(|| anyhow!("appearance commands exhausted"))?;
+
+                let retired_services = services.commit_reload(service_plan);
+                let retired_devices = match renderer_plan {
+                    RendererPlan::Keep => None,
+                    RendererPlan::Install(new_devices) => devices.replace(new_devices),
+                    RendererPlan::Remove => devices.take(),
+                };
+                *config = candidate.clone();
+                sequence.config_revision = revision;
+                sequence.global_stamps = crate::border_updates::AppearanceStamps {
+                    active: command,
+                    inactive: command,
+                    width: command,
+                    offset: command,
+                    radius: command,
+                };
+                APP_STATE.publish_config_generation(next_generation);
+                drop(devices);
+                drop(services);
+                drop(config);
+                drop(sequence);
+                Ok(crate::RetiredResources {
+                    services: retired_services,
+                    directx_devices: retired_devices,
+                })
+            })();
+
+            match commit {
+                Ok(retired) => {
+                    clear_watcher_rejection();
+                    return ReloadCompletion {
+                        outcome: ReloadOutcome::Applied {
+                            changed: true,
+                            generation: next_generation,
+                        },
+                        retired,
+                    };
+                }
+                Err(ReloadCommitError::Stale) if attempt == 0 => {
+                    continue;
+                }
+                Err(ReloadCommitError::Stale) => {
+                    return reject_reload(
+                        ReloadStage::StalePlan,
+                        anyhow!("reload plan became stale"),
+                        origin,
+                        rejection_fingerprint(
+                            &contents,
+                            ReloadStage::StalePlan,
+                            "plan remained stale after replan",
+                        ),
+                    );
+                }
+                Err(ReloadCommitError::Failed(error)) => {
+                    return reject_reload(
+                        ReloadStage::Commit,
+                        error,
+                        origin,
+                        rejection_fingerprint(&contents, ReloadStage::Commit, "commit failed"),
+                    );
+                }
+            }
         }
+        reject_reload(
+            ReloadStage::StalePlan,
+            anyhow!("reload plan remained stale after one retry"),
+            origin,
+            rejection_fingerprint(
+                &contents,
+                ReloadStage::StalePlan,
+                "plan remained stale after one retry",
+            ),
+        )
     }
 
     pub fn is_config_watcher_enabled(&self) -> bool {
@@ -599,11 +804,76 @@ impl Config {
     }
 }
 
-fn reject_reload(error: anyhow::Error) -> ReloadOutcome {
-    error!("could not reload config: {error:#}");
-    let message = format!("could not reload config: {error:#}");
-    thread::spawn(move || display_error_box(message, None));
-    ReloadOutcome::Rejected(error)
+enum RendererPlan<T> {
+    Keep,
+    Install(T),
+    Remove,
+}
+
+fn prepare_renderer_plan<T>(
+    required: bool,
+    present: bool,
+    create: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<RendererPlan<T>> {
+    match (required, present) {
+        (true, false) => create().map(RendererPlan::Install),
+        (false, true) => Ok(RendererPlan::Remove),
+        _ => Ok(RendererPlan::Keep),
+    }
+}
+
+enum ReloadCommitError {
+    Stale,
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ReloadCommitError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn rejection_fingerprint(contents: &str, stage: ReloadStage, description: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    stage.hash(&mut hasher);
+    description.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn clear_watcher_rejection() {
+    *LAST_WATCHER_REJECTION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
+fn reject_reload(
+    stage: ReloadStage,
+    error: anyhow::Error,
+    origin: crate::ReloadOrigin,
+    fingerprint: u64,
+) -> ReloadCompletion {
+    let report = if origin == crate::ReloadOrigin::Watcher {
+        let mut last = LAST_WATCHER_REJECTION
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *last == Some(fingerprint) {
+            false
+        } else {
+            *last = Some(fingerprint);
+            true
+        }
+    } else {
+        true
+    };
+    ReloadCompletion {
+        outcome: ReloadOutcome::Rejected {
+            stage,
+            error,
+            report,
+        },
+        retired: crate::RetiredResources::default(),
+    }
 }
 
 #[derive(Debug)]
@@ -657,7 +927,7 @@ impl ConfigWatcher {
 
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
-        let thread_handle = thread::spawn(move || unsafe {
+        let watcher_worker = move || unsafe {
             debug!("entering config watcher thread");
 
             // Reconvert isize back to HANDLE
@@ -704,7 +974,11 @@ impl ConfigWatcher {
             }
 
             debug!("exiting config watcher thread");
-        });
+        };
+        let thread_handle = thread::Builder::new()
+            .name("config-watcher".into())
+            .spawn(watcher_worker)
+            .context("could not start config watcher thread")?;
 
         Ok(Self {
             dir_handle,
@@ -801,24 +1075,89 @@ pub fn config_watcher_callback() {
 }
 
 fn request_config_reload() -> anyhow::Result<()> {
-    request_config_reload_with(|| crate::submit_host_action(crate::HostAction::ReloadConfig))
+    request_config_reload_with(|| {
+        crate::submit_host_action(crate::HostAction::ReloadConfig {
+            origin: crate::ReloadOrigin::Watcher,
+            response: None,
+        })
+    })
 }
 
 fn request_config_reload_with(submit: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
-    if CONFIG_RELOAD_PENDING.swap(true, Ordering::AcqRel) {
-        return Ok(());
+    match CONFIG_RELOAD_STATE.compare_exchange(
+        CONFIG_RELOAD_IDLE,
+        CONFIG_RELOAD_PENDING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            if let Err(error) = submit() {
+                CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Err(CONFIG_RELOAD_PENDING) => {
+            let _ = CONFIG_RELOAD_STATE.compare_exchange(
+                CONFIG_RELOAD_PENDING,
+                CONFIG_RELOAD_DIRTY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        Err(CONFIG_RELOAD_DIRTY) => {}
+        Err(_) => unreachable!("configuration reload state is bounded"),
     }
-
-    if let Err(error) = submit() {
-        CONFIG_RELOAD_PENDING.store(false, Ordering::Release);
-        return Err(error);
-    }
-
     Ok(())
 }
 
+pub fn finish_config_reload() {
+    loop {
+        match CONFIG_RELOAD_STATE.load(Ordering::Acquire) {
+            CONFIG_RELOAD_IDLE => return,
+            CONFIG_RELOAD_PENDING => {
+                if CONFIG_RELOAD_STATE
+                    .compare_exchange(
+                        CONFIG_RELOAD_PENDING,
+                        CONFIG_RELOAD_IDLE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            CONFIG_RELOAD_DIRTY => {
+                if CONFIG_RELOAD_STATE
+                    .compare_exchange(
+                        CONFIG_RELOAD_DIRTY,
+                        CONFIG_RELOAD_PENDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    if let Err(error) = submit_config_reload_action() {
+                        CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+                        error!("could not queue deferred config reload: {error:#}");
+                    }
+                    return;
+                }
+            }
+            _ => unreachable!("configuration reload state is bounded"),
+        }
+    }
+}
+
 pub fn begin_config_reload() {
-    CONFIG_RELOAD_PENDING.store(false, Ordering::Release);
+    CONFIG_RELOAD_STATE.store(CONFIG_RELOAD_IDLE, Ordering::Release);
+}
+
+fn submit_config_reload_action() -> anyhow::Result<()> {
+    crate::submit_host_action(crate::HostAction::ReloadConfig {
+        origin: crate::ReloadOrigin::Watcher,
+        response: None,
+    })
 }
 
 #[cfg(test)]
@@ -938,6 +1277,7 @@ mod runtime_config_tests {
     #[serial_test::serial]
     fn invalid_update_preserves_active_runtime_config() {
         let before = APP_STATE.config.read().unwrap().clone();
+        let generation = APP_STATE.config_generation();
         let result = APP_STATE.update_config(|source| {
             source.window_rules.push(rule(
                 Some(MatchKind::Title),
@@ -948,6 +1288,48 @@ mod runtime_config_tests {
 
         assert!(result.is_err());
         assert_eq!(*APP_STATE.config.read().unwrap(), before);
+        assert_eq!(APP_STATE.config_generation(), generation);
+
+        APP_STATE
+            .update_config(|source| source.enable_logging = !source.enable_logging)
+            .unwrap();
+        assert_eq!(APP_STATE.config_generation(), generation + 1);
+
+        APP_STATE
+            .update_config(|source| source.enable_logging = before.source().enable_logging)
+            .unwrap();
+        assert_eq!(APP_STATE.config_generation(), generation + 2);
+    }
+}
+
+#[cfg(test)]
+mod reload_plan_tests {
+    use super::*;
+
+    #[test]
+    fn renderer_plan_prepares_only_a_missing_required_renderer() {
+        let install = prepare_renderer_plan(true, false, || Ok("new renderer")).unwrap();
+        assert!(matches!(install, RendererPlan::Install("new renderer")));
+
+        let keep: RendererPlan<()> = prepare_renderer_plan(true, true, || {
+            anyhow::bail!("an active renderer must be reused")
+        })
+        .unwrap();
+        assert!(matches!(keep, RendererPlan::Keep));
+
+        let remove: RendererPlan<()> = prepare_renderer_plan(false, true, || {
+            anyhow::bail!("a stopping renderer must not be recreated")
+        })
+        .unwrap();
+        assert!(matches!(remove, RendererPlan::Remove));
+    }
+
+    #[test]
+    fn renderer_preparation_failure_is_returned_without_a_plan() {
+        let result: anyhow::Result<RendererPlan<()>> =
+            prepare_renderer_plan(true, false, || anyhow::bail!("injected renderer failure"));
+
+        assert!(result.is_err());
     }
 }
 

@@ -8,6 +8,7 @@ extern crate log;
 extern crate sp_log;
 
 use anyhow::{Context, anyhow};
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
@@ -22,8 +23,9 @@ use tacky_borders::ipc::{IpcCommand, socket_path};
 use tacky_borders::sys_tray_icon::create_tray_icon;
 use tacky_borders::utils::{LogIfErr, imm_disable_ime, set_process_dpi_awareness_context};
 use tacky_borders::{
-    APP_STATE, BG_SERVICES, HostAction, attach_parent_console, initialize_host_requests,
-    is_unwanted_instance, register_border_window_class, reload_borders, set_event_hook,
+    APP_STATE, BG_SERVICES, HostAction, ReloadOrigin, attach_parent_console, display_error_box,
+    initialize_host_requests, is_unwanted_instance, register_border_window_class, reload_borders,
+    set_event_hook,
 };
 use windows::Win32::Foundation::WAIT_FAILED;
 use windows::Win32::UI::Accessibility::UnhookWinEvent;
@@ -137,7 +139,6 @@ fn run_daemon() {
         hwineventhook,
         shutting_down,
         receipts,
-        None,
     );
     if services_ready {
         BG_SERVICES
@@ -148,49 +149,83 @@ fn run_daemon() {
     info!("exiting tacky-borders");
 }
 
-#[derive(Default)]
-struct ConfigReloadDispatch {
-    deferred: bool,
-    refresh_pending: bool,
+struct ConfigReloadRequest {
+    origin: ReloadOrigin,
+    response: Option<std::sync::mpsc::SyncSender<tacky_borders::IpcReloadResponse>>,
 }
 
-enum ConfigReloadCompletion {
-    Idle,
-    RefreshBorders,
-    SpawnDeferred,
+fn deliver_reload_outcome(
+    request: &ConfigReloadRequest,
+    outcome: tacky_borders::config::ReloadOutcome,
+) -> Option<std::sync::mpsc::Receiver<()>> {
+    if let Some(sender) = &request.response {
+        let (acknowledgement, received) = std::sync::mpsc::sync_channel(1);
+        if let Err(error) = sender.send(tacky_borders::IpcReloadResponse {
+            outcome,
+            acknowledgement,
+        }) {
+            debug!("ipc reload requester disconnected before response: {error}");
+            return None;
+        }
+        return Some(received);
+    }
+
+    match outcome {
+        tacky_borders::config::ReloadOutcome::Applied {
+            changed,
+            generation,
+        } => {
+            if changed {
+                info!("configuration generation {generation} applied");
+            }
+        }
+        tacky_borders::config::ReloadOutcome::Rejected {
+            stage,
+            error,
+            report,
+        } => {
+            let message = format!("could not reload config: {error:#}");
+            if report || request.origin == ReloadOrigin::Tray {
+                error!("config reload rejected during {stage:?}: {message}");
+            }
+            if request.origin == ReloadOrigin::Tray
+                && report
+                && let Err(error) = std::thread::Builder::new()
+                    .name("config-reload-error-dialog".into())
+                    .spawn(move || display_error_box(message, None))
+            {
+                error!("could not show config reload error dialog: {error}");
+            }
+        }
+    }
+    None
 }
 
-impl ConfigReloadDispatch {
-    fn request(&mut self, worker_active: bool) -> bool {
-        if worker_active {
-            self.deferred = true;
-            false
-        } else {
-            true
+fn reject_queued_ipc_reloads(
+    receiver: &std::sync::mpsc::Receiver<HostAction>,
+    pending: &mut VecDeque<HostAction>,
+) {
+    while let Ok(action) = receiver.try_recv() {
+        match action {
+            HostAction::ReloadConfig {
+                origin: ReloadOrigin::Ipc,
+                response: Some(response),
+            } => {
+                let request = ConfigReloadRequest {
+                    origin: ReloadOrigin::Ipc,
+                    response: Some(response),
+                };
+                let outcome = tacky_borders::config::ReloadOutcome::Rejected {
+                    stage: tacky_borders::config::ReloadStage::Commit,
+                    error: anyhow!("ipc server is being disabled by configuration reload"),
+                    report: true,
+                };
+                if let Some(acknowledgement) = deliver_reload_outcome(&request, outcome) {
+                    let _ = acknowledgement.recv();
+                }
+            }
+            other => pending.push_back(other),
         }
-    }
-
-    fn after_completion(
-        &mut self,
-        reload_succeeded: bool,
-        shutting_down: bool,
-    ) -> ConfigReloadCompletion {
-        self.refresh_pending |= reload_succeeded;
-        if shutting_down {
-            self.deferred = false;
-            self.refresh_pending = false;
-            ConfigReloadCompletion::Idle
-        } else if std::mem::take(&mut self.deferred) {
-            ConfigReloadCompletion::SpawnDeferred
-        } else if std::mem::take(&mut self.refresh_pending) {
-            ConfigReloadCompletion::RefreshBorders
-        } else {
-            ConfigReloadCompletion::Idle
-        }
-    }
-
-    fn deferred_spawn_failed(&mut self) -> bool {
-        std::mem::take(&mut self.refresh_pending)
     }
 }
 
@@ -201,11 +236,11 @@ fn run_host_loop(
     mut hwineventhook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
     mut shutting_down: bool,
     mut receipts: Vec<(LifecycleReceipt, bool)>,
-    mut config_reload: Option<std::thread::JoinHandle<tacky_borders::config::ReloadOutcome>>,
 ) {
     let mut stop_submitted = false;
     let mut wait_failed = false;
-    let mut config_reload_dispatch = ConfigReloadDispatch::default();
+    let mut pending_actions = VecDeque::new();
+    let mut config_refresh_pending = false;
     let mut reconciler = tacky_borders::utils::WindowReconciler::default();
     #[cfg(test)]
     let silent_completion = tacky_borders::border_registry::BorderEvent::new(true).unwrap();
@@ -245,7 +280,10 @@ fn run_host_loop(
             }
             if !shutting_down {
                 for _ in 0..MAX_COORDINATOR_BATCH {
-                    let Ok(action) = requests.receiver.try_recv() else {
+                    let action = pending_actions
+                        .pop_front()
+                        .or_else(|| requests.receiver.try_recv().ok());
+                    let Some(action) = action else {
                         break;
                     };
                     if receipts.len() == MAX_COORDINATOR_BATCH {
@@ -253,19 +291,37 @@ fn run_host_loop(
                         break;
                     }
                     let submitted = match action {
-                        HostAction::ReloadConfig => {
-                            if config_reload_dispatch.request(config_reload.is_some()) {
-                                tacky_borders::config::begin_config_reload();
-                                match std::thread::Builder::new()
-                                    .name("host-config-reload".into())
-                                    .spawn(tacky_borders::config::Config::reload)
-                                {
-                                    Ok(worker) => config_reload = Some(worker),
-                                    Err(error) => {
-                                        error!("could not spawn config reload worker: {error}")
-                                    }
-                                }
+                        HostAction::ReloadConfig { origin, response } => {
+                            let request = ConfigReloadRequest { origin, response };
+                            let completion = tacky_borders::config::Config::reload(origin);
+                            let reload_changed = matches!(
+                                &completion.outcome,
+                                tacky_borders::config::ReloadOutcome::Applied { changed: true, .. }
+                            );
+                            let retiring_ipc = completion.retired.retires_ipc_server();
+                            if retiring_ipc {
+                                tacky_borders::set_ipc_reload_submissions(false)
+                                    .context("close ipc reload admission")
+                                    .log_if_err();
+                                reject_queued_ipc_reloads(&requests.receiver, &mut pending_actions);
                             }
+                            if let Some(acknowledgement) =
+                                deliver_reload_outcome(&request, completion.outcome)
+                            {
+                                let _ = acknowledgement.recv();
+                            }
+                            let ipc_is_active = BG_SERVICES
+                                .lock()
+                                .map(|services| services.ipc_server_active())
+                                .unwrap_or_else(|poison| poison.into_inner().ipc_server_active());
+                            tacky_borders::set_ipc_reload_submissions(ipc_is_active)
+                                .context("update ipc reload admission")
+                                .log_if_err();
+                            completion.retired.retire();
+                            if origin == ReloadOrigin::Watcher {
+                                tacky_borders::config::finish_config_reload();
+                            }
+                            config_refresh_pending |= reload_changed;
                             continue;
                         }
                         HostAction::ReloadBorders => reload_borders(),
@@ -276,44 +332,8 @@ fn run_host_loop(
                     }
                 }
             }
-            if config_reload
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-                && let Some(worker) = config_reload.take()
-            {
-                let reload_changed = match worker.join() {
-                    Ok(tacky_borders::config::ReloadOutcome::Applied { changed }) => changed,
-                    Ok(tacky_borders::config::ReloadOutcome::Rejected(error)) => {
-                        error!("config reload rejected: {error:#}");
-                        false
-                    }
-                    Err(payload) => {
-                        tacky_borders::border_registry::discard_panic(payload);
-                        error!("config reload worker panicked");
-                        false
-                    }
-                };
-                match config_reload_dispatch.after_completion(reload_changed, shutting_down) {
-                    ConfigReloadCompletion::SpawnDeferred => {
-                        tacky_borders::config::begin_config_reload();
-                        match std::thread::Builder::new()
-                            .name("host-config-reload".into())
-                            .spawn(tacky_borders::config::Config::reload)
-                        {
-                            Ok(worker) => config_reload = Some(worker),
-                            Err(error) => {
-                                error!("could not spawn deferred config reload worker: {error}");
-                                if config_reload_dispatch.deferred_spawn_failed() {
-                                    submit_config_reload_border_refresh(&mut receipts);
-                                }
-                            }
-                        }
-                    }
-                    ConfigReloadCompletion::RefreshBorders => {
-                        submit_config_reload_border_refresh(&mut receipts);
-                    }
-                    ConfigReloadCompletion::Idle => {}
-                }
+            if std::mem::take(&mut config_refresh_pending) {
+                submit_config_reload_border_refresh(&mut receipts);
             }
             for index in (0..receipts.len()).rev() {
                 match receipts[index].0.try_result() {
@@ -339,8 +359,7 @@ fn run_host_loop(
             }
             if coordinator.is_terminal() {
                 let result = coordinator.join_terminal();
-                if coordinator.has_joined() && config_reload.is_none() {
-                    tacky_borders::config::begin_config_reload();
+                if coordinator.has_joined() {
                     result.log_if_err();
                     return true;
                 }
@@ -604,57 +623,31 @@ mod host_tests {
     }
 
     #[test]
-    fn config_reload_dispatch_coalesces_active_requests() {
-        let mut dispatch = ConfigReloadDispatch::default();
-
-        assert!(dispatch.request(false));
-        assert!(!dispatch.request(true));
-        assert!(!dispatch.request(true));
+    fn ipc_reload_reply_waits_for_response_write_acknowledgement() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let request = ConfigReloadRequest {
+            origin: ReloadOrigin::Ipc,
+            response: Some(sender),
+        };
+        let acknowledgement = deliver_reload_outcome(
+            &request,
+            tacky_borders::config::ReloadOutcome::Applied {
+                changed: true,
+                generation: 4,
+            },
+        )
+        .unwrap();
+        let reply = receiver.recv().unwrap();
         assert!(matches!(
-            dispatch.after_completion(true, false),
-            ConfigReloadCompletion::SpawnDeferred
+            reply.outcome,
+            tacky_borders::config::ReloadOutcome::Applied {
+                changed: true,
+                generation: 4
+            }
         ));
-        assert!(matches!(
-            dispatch.after_completion(false, false),
-            ConfigReloadCompletion::RefreshBorders
-        ));
-
-        assert!(!dispatch.request(true));
-        assert!(matches!(
-            dispatch.after_completion(false, false),
-            ConfigReloadCompletion::SpawnDeferred
-        ));
-        assert!(!dispatch.deferred_spawn_failed());
-    }
-
-    #[test]
-    fn config_reload_dispatch_discards_deferred_start_on_shutdown() {
-        let mut dispatch = ConfigReloadDispatch::default();
-
-        assert!(!dispatch.request(true));
-        assert!(matches!(
-            dispatch.after_completion(true, true),
-            ConfigReloadCompletion::Idle
-        ));
-        assert!(matches!(
-            dispatch.after_completion(false, false),
-            ConfigReloadCompletion::Idle
-        ));
-    }
-
-    #[test]
-    fn config_reload_dispatch_retains_refresh_after_failed_deferred_reload() {
-        let mut dispatch = ConfigReloadDispatch::default();
-
-        assert!(!dispatch.request(true));
-        assert!(matches!(
-            dispatch.after_completion(true, false),
-            ConfigReloadCompletion::SpawnDeferred
-        ));
-        assert!(matches!(
-            dispatch.after_completion(false, false),
-            ConfigReloadCompletion::RefreshBorders
-        ));
+        assert!(acknowledgement.try_recv().is_err());
+        reply.acknowledgement.send(()).unwrap();
+        acknowledgement.recv().unwrap();
     }
 
     #[test]
@@ -747,23 +740,6 @@ mod host_tests {
             std::thread::yield_now();
         };
         let config = APP_STATE.get_config_mut();
-        let (release, waiting) = std::sync::mpsc::channel();
-        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let completed = finished.clone();
-        let job = std::thread::spawn(move || {
-            waiting.recv().unwrap();
-            completed.store(true, std::sync::atomic::Ordering::Release);
-            tacky_borders::config::ReloadOutcome::Applied { changed: false }
-        });
-        let retiring = registry.clone();
-        let unblock = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !retiring.lock().unwrap().shutdown_requested {
-                assert!(std::time::Instant::now() < deadline);
-                std::thread::yield_now();
-            }
-            release.send(()).unwrap();
-        });
         if !shutting_down {
             unsafe {
                 windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
@@ -777,10 +753,7 @@ mod host_tests {
             Default::default(),
             shutting_down,
             Vec::new(),
-            Some(job),
         );
-        unblock.join().unwrap();
-        assert!(finished.load(std::sync::atomic::Ordering::Acquire));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(coordinator.is_terminal());
         assert!(coordinator.has_joined());

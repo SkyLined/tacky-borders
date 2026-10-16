@@ -57,7 +57,11 @@ pub fn create_tray_icon(_hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIco
         }
         // Reload
         "2" => {
-            submit_host_action(HostAction::ReloadConfig).log_if_err();
+            submit_host_action(HostAction::ReloadConfig {
+                origin: crate::ReloadOrigin::Tray,
+                response: None,
+            })
+            .log_if_err();
         }
         // Close
         "3" => {

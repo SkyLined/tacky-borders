@@ -14,7 +14,9 @@ use crate::APP_STATE;
 use crate::border_registry::{BorderRegistry, TrackingWindowFingerprint};
 use crate::border_updates::{AppearanceSequencer, IpcUpdate};
 use crate::colors::ColorBrushConfig;
-use crate::config::{Config, OffsetConfig, RadiusConfig, RuntimeConfig, WidthConfig};
+use crate::config::{
+    Config, OffsetConfig, RadiusConfig, ReloadOutcome, RuntimeConfig, WidthConfig,
+};
 use crate::iocp::{SocketId, UnixListener, UnixStream, shutdown_socket};
 use crate::ipc_security::restrict_socket_path;
 use crate::utils::{LogIfErr, get_foreground_window, remove_file_if_exists};
@@ -598,7 +600,11 @@ fn handle_client_with_limits(
 
         remaining(connection_deadline, "connection")?;
         let response = process_command(trimmed);
-        write_response(stream, response, limits, connection_deadline, stop)?;
+        let write_result = write_response(stream, response.body, limits, connection_deadline, stop);
+        if let Some(acknowledgement) = response.acknowledgement {
+            let _ = acknowledgement.send(());
+        }
+        write_result?;
     }
 
     write_protocol_error(
@@ -721,11 +727,27 @@ pub enum IpcCommand {
     GetState,
 }
 
-fn process_command(raw: &str) -> String {
+struct CommandResponse {
+    body: String,
+    acknowledgement: Option<std::sync::mpsc::SyncSender<()>>,
+}
+
+impl CommandResponse {
+    fn plain(body: String) -> Self {
+        Self {
+            body,
+            acknowledgement: None,
+        }
+    }
+}
+
+fn process_command(raw: &str) -> CommandResponse {
     let command: IpcCommand = match serde_json::from_str(raw) {
         Ok(command) => command,
         Err(err) => {
-            return json!({"ok": false, "error": format!("invalid command: {err}")}).to_string();
+            return CommandResponse::plain(
+                json!({"ok": false, "error": format!("invalid command: {err}")}).to_string(),
+            );
         }
     };
 
@@ -736,34 +758,25 @@ fn process_command(raw: &str) -> String {
             focused,
         } => {
             if active.is_none() && inactive.is_none() {
-                return json!({"ok": false, "error": "no colors provided"}).to_string();
+                return CommandResponse::plain(
+                    json!({"ok": false, "error": "no colors provided"}).to_string(),
+                );
             }
-            apply_update(IpcUpdate::Colors { active, inactive }, focused)
+            CommandResponse::plain(apply_update(
+                IpcUpdate::Colors { active, inactive },
+                focused,
+            ))
         }
-        IpcCommand::SetWidth { width, focused } => apply_update(IpcUpdate::Width(width), focused),
+        IpcCommand::SetWidth { width, focused } => {
+            CommandResponse::plain(apply_update(IpcUpdate::Width(width), focused))
+        }
         IpcCommand::SetOffset { offset, focused } => {
-            apply_update(IpcUpdate::Offset(offset), focused)
+            CommandResponse::plain(apply_update(IpcUpdate::Offset(offset), focused))
         }
         IpcCommand::SetRadius { radius, focused } => {
-            apply_update(IpcUpdate::Radius(radius), focused)
+            CommandResponse::plain(apply_update(IpcUpdate::Radius(radius), focused))
         }
-        IpcCommand::Reload => {
-            match Config::reload() {
-                crate::config::ReloadOutcome::Applied { changed: false } => {
-                    json!({"ok": true, "changed": false}).to_string()
-                }
-                crate::config::ReloadOutcome::Applied { changed: true } => {
-                    match crate::reload_borders().and_then(|receipt| receipt.wait()) {
-                        Ok(crate::border_coordinator::OperationOutcome::Reloaded { old_generation_retired, admitted_instances, skipped_invalid, skipped_ineligible, .. }) => json!({"ok": true, "changed": true, "old_generation_retired": old_generation_retired, "admitted_instances": admitted_instances.iter().map(|id| id.0).collect::<Vec<_>>(), "skipped_invalid": skipped_invalid, "skipped_ineligible": skipped_ineligible, "border_readiness": "not_awaited"}).to_string(),
-                        Ok(outcome) => json!({"ok": false, "changed": true, "error": format!("reload not admitted: {outcome:?}")}).to_string(),
-                        Err(error) => json!({"ok": false, "changed": true, "error": format!("reload failed: {error:#}")}).to_string(),
-                    }
-                }
-                crate::config::ReloadOutcome::Rejected(error) => {
-                    json!({"ok": false, "changed": false, "error": format!("reload rejected: {error:#}")}).to_string()
-                }
-            }
-        }
+        IpcCommand::Reload => reload_from_host(),
         IpcCommand::GetState => {
             let (active_color, inactive_color, border_width, border_offset, border_radius) = {
                 let config = APP_STATE.config.read().unwrap();
@@ -777,22 +790,61 @@ fn process_command(raw: &str) -> String {
             };
             let active_window = {
                 let isize = *APP_STATE.active_window.lock().unwrap();
-                format!("{isize:#x}") // format as hex
+                format!("{isize:#x}")
             };
             let border_count = APP_STATE.border_windows().len();
 
-            json!({
-                "ok": true,
-                "active_window": active_window,
-                "border_count": border_count,
-                "active_color": active_color,
-                "inactive_color": inactive_color,
-                "border_width": border_width,
-                "border_offset": border_offset,
-                "border_radius": border_radius,
-            })
-            .to_string()
+            CommandResponse::plain(
+                json!({
+                    "ok": true,
+                    "active_window": active_window,
+                    "border_count": border_count,
+                    "active_color": active_color,
+                    "inactive_color": inactive_color,
+                    "border_width": border_width,
+                    "border_offset": border_offset,
+                    "border_radius": border_radius,
+                })
+                .to_string(),
+            )
         }
+    }
+}
+
+fn reload_from_host() -> CommandResponse {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if let Err(error) = crate::submit_ipc_reload(sender) {
+        return CommandResponse::plain(
+            json!({"ok": false, "changed": false, "error": format!("reload request rejected: {error:#}")})
+                .to_string(),
+        );
+    }
+
+    match receiver.recv_timeout(IPC_COMMAND_TIMEOUT) {
+        Ok(reply) => {
+            let body = match reply.outcome {
+                ReloadOutcome::Applied {
+                    changed,
+                    generation,
+                } => json!({"ok": true, "changed": changed, "generation": generation}),
+                ReloadOutcome::Rejected {
+                    stage,
+                    error,
+                    ..
+                } => {
+                    json!({"ok": false, "changed": false, "stage": format!("{stage:?}"), "error": format!("reload rejected: {error:#}")})
+                }
+            }
+            .to_string();
+            CommandResponse {
+                body,
+                acknowledgement: Some(reply.acknowledgement),
+            }
+        }
+        Err(error) => CommandResponse::plain(
+            json!({"ok": false, "changed": false, "error": format!("reload coordinator unavailable: {error}")})
+                .to_string(),
+        ),
     }
 }
 
@@ -832,15 +884,52 @@ fn apply_update(update: IpcUpdate, focused: bool) -> String {
     } else {
         TargetSelection::All
     };
-    match broadcast_update(&APP_STATE.appearance, &APP_STATE.config, &APP_STATE.border_registry, selection, update) {
+    match broadcast_update_with_generation(
+        &APP_STATE.appearance,
+        &APP_STATE.config,
+        &APP_STATE.config_generation,
+        &APP_STATE.border_registry,
+        selection,
+        update,
+    ) {
         Ok(report) => report.response(),
         Err(error) => json!({"ok": false, "partial": false, "config_changed": false, "intended_targets": 0, "accepted_targets": 0, "failed_targets": 0, "error": format!("setter rejected: {error:#}")}).to_string(),
     }
 }
 
+#[cfg(test)]
 fn broadcast_update(
     gate: &Mutex<AppearanceSequencer>,
     config: &RwLock<RuntimeConfig>,
+    registry: &Mutex<BorderRegistry>,
+    selection: TargetSelection,
+    update: IpcUpdate,
+) -> anyhow::Result<IpcDeliveryReport> {
+    broadcast_update_inner(gate, config, None, registry, selection, update)
+}
+
+fn broadcast_update_with_generation(
+    gate: &Mutex<AppearanceSequencer>,
+    config: &RwLock<RuntimeConfig>,
+    config_generation: &AtomicU64,
+    registry: &Mutex<BorderRegistry>,
+    selection: TargetSelection,
+    update: IpcUpdate,
+) -> anyhow::Result<IpcDeliveryReport> {
+    broadcast_update_inner(
+        gate,
+        config,
+        Some(config_generation),
+        registry,
+        selection,
+        update,
+    )
+}
+
+fn broadcast_update_inner(
+    gate: &Mutex<AppearanceSequencer>,
+    config: &RwLock<RuntimeConfig>,
+    config_generation: Option<&AtomicU64>,
     registry: &Mutex<BorderRegistry>,
     selection: TargetSelection,
     update: IpcUpdate,
@@ -867,6 +956,13 @@ fn broadcast_update(
         let mut config = config
             .write()
             .map_err(|_| anyhow::anyhow!("configuration poisoned"))?;
+        if let Some(config_generation) = config_generation {
+            config_generation
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    generation.checked_add(1)
+                })
+                .map_err(|_| anyhow::anyhow!("configuration generations exhausted"))?;
+        }
         let global = config.global_mut();
         match &update {
             IpcUpdate::Colors { active, inactive } => {
