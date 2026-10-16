@@ -42,8 +42,8 @@ use utils::{
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, FALSE, HANDLE, HMODULE, HWND, LPARAM, TRUE,
-    WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
+    ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, FALSE, HANDLE, HMODULE, HWND,
+    LPARAM, SetLastError, TRUE, WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1CreateFactory, ID2D1Device, ID2D1Factory1,
@@ -68,10 +68,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_MAX, EVENT_MIN, EnumWindows, IDC_ARROW, IDNO, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WNDCLASSEXW,
+    EVENT_MAX, EVENT_MIN, EnumWindows, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK,
+    MB_SETFOREGROUND, MB_TOPMOST, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW,
+    RegisterClassExW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WNDCLASSEXW,
 };
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
@@ -862,54 +861,137 @@ pub fn display_error_box<T: std::fmt::Display>(
     }
 }
 
-pub fn display_question_box<T: std::fmt::Display>(
-    question: T,
-    extra_styles: Option<MESSAGEBOX_STYLE>,
-) -> MESSAGEBOX_RESULT {
-    let question_vec: Vec<u16> = question
-        .to_string()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+const DAEMON_MUTEX_NAME: PCWSTR = w!("Local\\tacky-borders-a6b83a75-bebb-46ac-b29f-ea9aa0855fa2");
 
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(question_vec.as_ptr()),
-            w!("tacky-borders"),
-            MB_YESNO
-                | MB_ICONQUESTION
-                | MB_SETFOREGROUND
-                | MB_TOPMOST
-                | extra_styles.unwrap_or_default(),
-        )
+#[derive(Debug)]
+pub enum DaemonInstanceClaim {
+    Acquired(DaemonInstanceGuard),
+    AlreadyRunning(DaemonInstanceGuard),
+}
+
+#[derive(Debug)]
+pub struct DaemonInstanceGuard {
+    _handle: OwnedHANDLE,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_DAEMON_MUTEX_CLAIM: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_daemon_mutex_claim_for_test() {
+    FAIL_NEXT_DAEMON_MUTEX_CLAIM.set(true);
+}
+
+pub fn claim_daemon_instance() -> anyhow::Result<DaemonInstanceClaim> {
+    claim_named_instance(DAEMON_MUTEX_NAME)
+}
+
+fn claim_named_instance(name: PCWSTR) -> anyhow::Result<DaemonInstanceClaim> {
+    #[cfg(test)]
+    if FAIL_NEXT_DAEMON_MUTEX_CLAIM.replace(false) {
+        anyhow::bail!("injected CreateMutexW failure");
+    }
+
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let handle = unsafe { CreateMutexW(None, false, name) }
+        .context("could not create daemon instance mutex")?;
+    let already_exists = get_last_error() == ERROR_ALREADY_EXISTS;
+    let guard = DaemonInstanceGuard {
+        _handle: OwnedHANDLE(handle),
+    };
+
+    if already_exists {
+        Ok(DaemonInstanceClaim::AlreadyRunning(guard))
+    } else {
+        Ok(DaemonInstanceClaim::Acquired(guard))
     }
 }
 
-pub fn is_unwanted_instance() -> bool {
-    static IS_UNWANTED: OnceLock<bool> = OnceLock::new();
+#[cfg(test)]
+mod daemon_instance_claim_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    *IS_UNWANTED.get_or_init(|| {
-        const MUTEX_NAME: PCWSTR = w!("Local\\tacky-borders-a6b83a75-bebb-46ac-b29f-ea9aa0855fa2");
+    static NEXT_TEST_MUTEX: AtomicU64 = AtomicU64::new(0);
 
-        // Note that this creates a raw handle that gets leaked when it goes out of scope. This is
-        // intentional. We want this Mutex to remain alive for the duration of the program. And,
-        // MSDN says the handle is automatically closed upon application exit, so leaking is fine.
-        let mutex_res = unsafe { CreateMutexW(None, false, MUTEX_NAME) };
+    fn test_mutex_name() -> Vec<u16> {
+        format!(
+            "Local\\tacky-borders-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_MUTEX.fetch_add(1, Ordering::Relaxed)
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+    }
 
-        // Note that in the case of ERROR_ALREADY_EXISTS, CreateMutexW still returns Ok with a handle
-        // to the existing Mutex, so we need to check the error separately with GetLastError.
-        if mutex_res.is_err() || get_last_error() == ERROR_ALREADY_EXISTS {
-            let yes_no_decision = display_question_box(
-                "an instance of tacky-borders is already running; continue anyways?",
-                Some(MB_DEFBUTTON2),
-            );
+    fn claim_test_mutex(name: &[u16]) -> anyhow::Result<DaemonInstanceClaim> {
+        claim_named_instance(PCWSTR(name.as_ptr()))
+    }
 
-            return yes_no_decision == IDNO;
-        }
+    #[test]
+    fn named_claim_is_exclusive_and_released_with_guard() {
+        let name = test_mutex_name();
+        let first = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&first, DaemonInstanceClaim::Acquired(_)));
 
-        false
-    })
+        let second = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&second, DaemonInstanceClaim::AlreadyRunning(_)));
+        drop(first);
+
+        let third = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&third, DaemonInstanceClaim::AlreadyRunning(_)));
+
+        drop((second, third));
+        let fourth = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&fourth, DaemonInstanceClaim::Acquired(_)));
+    }
+
+    #[test]
+    fn stale_already_exists_error_does_not_reject_a_new_mutex() {
+        let name = test_mutex_name();
+        unsafe { SetLastError(ERROR_ALREADY_EXISTS) };
+
+        let claim = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&claim, DaemonInstanceClaim::Acquired(_)));
+    }
+
+    #[test]
+    fn simultaneous_claims_have_exactly_one_winner() {
+        let name = test_mutex_name();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let name = name.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let claim = claim_test_mutex(&name).unwrap();
+                    let acquired = matches!(&claim, DaemonInstanceClaim::Acquired(_));
+                    barrier.wait();
+                    drop(claim);
+                    acquired
+                })
+            })
+            .collect::<Vec<_>>();
+        let claims = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(claims.iter().filter(|acquired| **acquired).count(), 1);
+        assert_eq!(claims.iter().filter(|acquired| !**acquired).count(), 1);
+    }
+
+    #[test]
+    fn mutex_creation_failure_is_not_reported_as_duplicate() {
+        fail_next_daemon_mutex_claim_for_test();
+        let error = claim_daemon_instance().unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected CreateMutexW failure"));
+    }
 }
 
 thread_local! {

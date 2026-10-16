@@ -23,17 +23,19 @@ use tacky_borders::ipc::{IpcCommand, socket_path};
 use tacky_borders::sys_tray_icon::create_tray_icon;
 use tacky_borders::utils::{LogIfErr, imm_disable_ime, set_process_dpi_awareness_context};
 use tacky_borders::{
-    APP_STATE, BG_SERVICES, HostAction, ReloadOrigin, attach_parent_console, display_error_box,
-    initialize_host_requests, is_unwanted_instance, register_border_window_class, reload_borders,
-    set_event_hook,
+    APP_STATE, BG_SERVICES, DaemonInstanceClaim, HostAction, ReloadOrigin, attach_parent_console,
+    claim_daemon_instance, display_error_box, initialize_host_requests,
+    register_border_window_class, reload_borders, set_event_hook,
 };
 use windows::Win32::Foundation::WAIT_FAILED;
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::UI::Accessibility::UnhookWinEvent;
 use windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
     PeekMessageW, QS_ALLINPUT, TranslateMessage, WM_QUIT,
 };
+use windows::core::PCWSTR;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -52,15 +54,62 @@ fn main() -> ExitCode {
         };
     }
 
-    run_daemon();
-    ExitCode::SUCCESS
+    match run_daemon() {
+        Ok(DaemonRunOutcome::Ran | DaemonRunOutcome::Duplicate) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_early_startup_error(&error);
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn run_daemon() {
-    if is_unwanted_instance() {
-        return;
-    }
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonRunOutcome {
+    Ran,
+    Duplicate,
+}
 
+fn run_daemon_with<G>(
+    claim: impl FnOnce() -> anyhow::Result<Option<G>>,
+    initialize: impl FnOnce(),
+) -> anyhow::Result<DaemonRunOutcome> {
+    match claim()? {
+        None => Ok(DaemonRunOutcome::Duplicate),
+        Some(_guard) => {
+            initialize();
+            Ok(DaemonRunOutcome::Ran)
+        }
+    }
+}
+
+fn run_daemon() -> anyhow::Result<DaemonRunOutcome> {
+    run_daemon_with(
+        || {
+            Ok(match claim_daemon_instance()? {
+                DaemonInstanceClaim::Acquired(guard) => Some(guard),
+                DaemonInstanceClaim::AlreadyRunning(guard) => {
+                    drop(guard);
+                    None
+                }
+            })
+        },
+        run_daemon_initialized,
+    )
+}
+
+fn report_early_startup_error(error: &anyhow::Error) {
+    let message = format!("error: {error:#}");
+    let _ = writeln!(std::io::stderr(), "{message}");
+    let message_wide = message
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        OutputDebugStringW(PCWSTR(message_wide.as_ptr()));
+    }
+}
+
+fn run_daemon_initialized() {
     // Force initialization of our app state
     let _ = LazyLock::force(&APP_STATE);
 
@@ -600,6 +649,53 @@ fn parse_radius_arg(s: &str) -> anyhow::Result<RadiusConfig> {
 #[cfg(test)]
 mod host_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_daemon_claim_skips_initialization() {
+        let initialized = std::cell::Cell::new(false);
+        let outcome = run_daemon_with(
+            || Ok::<_, anyhow::Error>(None::<()>),
+            || initialized.set(true),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, DaemonRunOutcome::Duplicate);
+        assert!(!initialized.get());
+    }
+
+    #[test]
+    fn daemon_claim_failure_skips_initialization() {
+        let initialized = std::cell::Cell::new(false);
+        let result = run_daemon_with(
+            || Err::<Option<()>, _>(anyhow!("injected mutex failure")),
+            || initialized.set(true),
+        );
+
+        assert!(result.is_err());
+        assert!(!initialized.get());
+    }
+
+    #[test]
+    fn acquired_daemon_claim_is_held_until_initialization_returns() {
+        struct ClaimGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for ClaimGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = ClaimGuard(held.clone());
+        let outcome = run_daemon_with(
+            || Ok::<_, anyhow::Error>(Some(guard)),
+            || assert!(held.load(std::sync::atomic::Ordering::Acquire)),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, DaemonRunOutcome::Ran);
+        assert!(!held.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     static REQUESTS: std::sync::LazyLock<std::sync::Mutex<tacky_borders::HostRequests>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(initialize_host_requests().unwrap()));
