@@ -836,11 +836,10 @@ fn animated_resource_stress_helper() -> anyhow::Result<()> {
     let animations: AnimationsConfig = serde_json::from_value(serde_json::json!({
         "active": [{ "type": "Spiral" }], "inactive": [{ "type": "Spiral" }], "fps": 30, "enabled": true
     }))?;
-    {
-        let mut config = APP_STATE.get_config_mut();
+    APP_STATE.update_config(|config| {
         config.global.follow_native_border = false;
         config.global.animations = animations;
-    }
+    })?;
     fn phase(phase: &str) -> anyhow::Result<()> {
         use std::io::Write;
         println!("{}", serde_json::json!({"phase": phase}));

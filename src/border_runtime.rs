@@ -481,7 +481,7 @@ impl BorderWorkerContext {
 
 enum SnapshotResult {
     Ready(
-        Box<crate::config::Config>,
+        Box<crate::config::RuntimeConfig>,
         u64,
         crate::border_updates::AppearanceStamps,
     ),

@@ -14,7 +14,7 @@ use crate::APP_STATE;
 use crate::border_registry::{BorderRegistry, TrackingWindowFingerprint};
 use crate::border_updates::{AppearanceSequencer, IpcUpdate};
 use crate::colors::ColorBrushConfig;
-use crate::config::{Config, OffsetConfig, RadiusConfig, WidthConfig};
+use crate::config::{Config, OffsetConfig, RadiusConfig, RuntimeConfig, WidthConfig};
 use crate::iocp::{SocketId, UnixListener, UnixStream, shutdown_socket};
 use crate::ipc_security::restrict_socket_path;
 use crate::utils::{LogIfErr, get_foreground_window, remove_file_if_exists};
@@ -748,10 +748,20 @@ fn process_command(raw: &str) -> String {
             apply_update(IpcUpdate::Radius(radius), focused)
         }
         IpcCommand::Reload => {
-            match Config::reload().and_then(|_| crate::reload_borders()).and_then(|receipt| receipt.wait()) {
-                Ok(crate::border_coordinator::OperationOutcome::Reloaded { old_generation_retired, admitted_instances, skipped_invalid, skipped_ineligible, .. }) => json!({"ok": true, "old_generation_retired": old_generation_retired, "admitted_instances": admitted_instances.iter().map(|id| id.0).collect::<Vec<_>>(), "skipped_invalid": skipped_invalid, "skipped_ineligible": skipped_ineligible, "border_readiness": "not_awaited"}).to_string(),
-                Ok(outcome) => json!({"ok": false, "error": format!("reload not admitted: {outcome:?}")}).to_string(),
-                Err(error) => json!({"ok": false, "error": format!("reload failed: {error:#}")}).to_string(),
+            match Config::reload() {
+                crate::config::ReloadOutcome::Applied { changed: false } => {
+                    json!({"ok": true, "changed": false}).to_string()
+                }
+                crate::config::ReloadOutcome::Applied { changed: true } => {
+                    match crate::reload_borders().and_then(|receipt| receipt.wait()) {
+                        Ok(crate::border_coordinator::OperationOutcome::Reloaded { old_generation_retired, admitted_instances, skipped_invalid, skipped_ineligible, .. }) => json!({"ok": true, "changed": true, "old_generation_retired": old_generation_retired, "admitted_instances": admitted_instances.iter().map(|id| id.0).collect::<Vec<_>>(), "skipped_invalid": skipped_invalid, "skipped_ineligible": skipped_ineligible, "border_readiness": "not_awaited"}).to_string(),
+                        Ok(outcome) => json!({"ok": false, "changed": true, "error": format!("reload not admitted: {outcome:?}")}).to_string(),
+                        Err(error) => json!({"ok": false, "changed": true, "error": format!("reload failed: {error:#}")}).to_string(),
+                    }
+                }
+                crate::config::ReloadOutcome::Rejected(error) => {
+                    json!({"ok": false, "changed": false, "error": format!("reload rejected: {error:#}")}).to_string()
+                }
             }
         }
         IpcCommand::GetState => {
@@ -830,7 +840,7 @@ fn apply_update(update: IpcUpdate, focused: bool) -> String {
 
 fn broadcast_update(
     gate: &Mutex<AppearanceSequencer>,
-    config: &RwLock<Config>,
+    config: &RwLock<RuntimeConfig>,
     registry: &Mutex<BorderRegistry>,
     selection: TargetSelection,
     update: IpcUpdate,
@@ -857,7 +867,7 @@ fn broadcast_update(
         let mut config = config
             .write()
             .map_err(|_| anyhow::anyhow!("configuration poisoned"))?;
-        let global = &mut config.global;
+        let global = config.global_mut();
         match &update {
             IpcUpdate::Colors { active, inactive } => {
                 if let Some(color) = active {
@@ -940,7 +950,7 @@ mod tests {
 
     type IpcFixture = (
         Arc<Mutex<AppearanceSequencer>>,
-        Arc<RwLock<Config>>,
+        Arc<RwLock<RuntimeConfig>>,
         Arc<Mutex<BorderRegistry>>,
         Arc<BorderUpdateMailbox>,
     );
@@ -965,7 +975,7 @@ mod tests {
         ));
         (
             Arc::new(Mutex::new(AppearanceSequencer::default())),
-            Arc::new(RwLock::new(Config::default())),
+            Arc::new(RwLock::new(RuntimeConfig::fallback())),
             Arc::new(Mutex::new(registry)),
             mailbox,
         )
@@ -1399,7 +1409,7 @@ mod tests {
 
     #[test]
     fn unchanged_global_with_zero_targets_is_complete_acceptance() {
-        let config = RwLock::new(Config::default());
+        let config = RwLock::new(RuntimeConfig::fallback());
         let width = config.read().unwrap().global.border_width;
         let report = broadcast_update(
             &Mutex::default(),

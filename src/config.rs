@@ -7,8 +7,10 @@ use crate::utils::{OwnedHANDLE, get_adjusted_radius, get_window_corner_preferenc
 use crate::{APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11, display_error_box};
 use anyhow::{Context, anyhow};
 use dirs::home_dir;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder};
+use std::ops::Deref;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -144,6 +146,147 @@ pub enum MatchStrategy {
     Equals,
     Contains,
     Regex,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    source: Config,
+    window_rules: Vec<ResolvedWindowRule>,
+}
+
+impl PartialEq for RuntimeConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self::fallback()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for RuntimeConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.source
+    }
+}
+
+impl Deref for RuntimeConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedWindowRule {
+    source: WindowRule,
+    kind: MatchKind,
+    matcher: WindowMatcher,
+}
+
+#[derive(Clone, Debug)]
+enum WindowMatcher {
+    Equals(String),
+    Contains(String),
+    Regex(Regex),
+}
+
+#[derive(Debug)]
+pub enum ReloadOutcome {
+    Applied { changed: bool },
+    Rejected(anyhow::Error),
+}
+
+impl RuntimeConfig {
+    pub fn from_source(source: Config) -> anyhow::Result<Self> {
+        let window_rules = source
+            .window_rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let display_index = index + 1;
+                let kind = rule.kind.ok_or_else(|| {
+                    anyhow!("window_rules[{display_index}].match is required")
+                })?;
+                let name = rule.name.as_ref().ok_or_else(|| {
+                    anyhow!("window_rules[{display_index}].name is required")
+                })?;
+                let strategy = rule.strategy.unwrap_or(MatchStrategy::Equals);
+                let matcher = match strategy {
+                    MatchStrategy::Equals => WindowMatcher::Equals(name.to_lowercase()),
+                    MatchStrategy::Contains => WindowMatcher::Contains(name.to_lowercase()),
+                    MatchStrategy::Regex => WindowMatcher::Regex(
+                        Regex::new(name).with_context(|| {
+                            format!(
+                                "window_rules[{display_index}] ({kind:?}, {strategy:?}) has invalid pattern {name:?}"
+                            )
+                        })?,
+                    ),
+                };
+
+                Ok(ResolvedWindowRule {
+                    source: rule.clone(),
+                    kind,
+                    matcher,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(Self {
+            source,
+            window_rules,
+        })
+    }
+
+    pub fn parse(contents: &str) -> anyhow::Result<Self> {
+        let source = serde_yaml_ng::from_str(contents).map_err(anyhow::Error::new)?;
+        Self::from_source(source)
+    }
+
+    pub fn load() -> anyhow::Result<Self> {
+        Self::parse(&Config::read_contents()?)
+    }
+
+    pub fn fallback() -> Self {
+        Self {
+            source: Config::default(),
+            window_rules: Vec::new(),
+        }
+    }
+
+    pub fn source(&self) -> &Config {
+        &self.source
+    }
+
+    pub(crate) fn global_mut(&mut self) -> &mut Global {
+        &mut self.source.global
+    }
+
+    pub(crate) fn window_rules(&self) -> &[ResolvedWindowRule] {
+        &self.window_rules
+    }
+}
+
+impl ResolvedWindowRule {
+    pub(crate) fn source(&self) -> &WindowRule {
+        &self.source
+    }
+
+    pub(crate) fn kind(&self) -> MatchKind {
+        self.kind
+    }
+
+    pub(crate) fn is_match(&self, window_name: &str) -> bool {
+        match &self.matcher {
+            WindowMatcher::Equals(pattern) => window_name.to_lowercase() == *pattern,
+            WindowMatcher::Contains(pattern) => window_name.to_lowercase().contains(pattern),
+            WindowMatcher::Regex(regex) => regex.is_match(window_name),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -282,6 +425,11 @@ pub enum ZOrderMode {
 
 impl Config {
     pub fn create() -> anyhow::Result<Self> {
+        let contents = Self::read_contents()?;
+        serde_yaml_ng::from_str(&contents).map_err(anyhow::Error::new)
+    }
+
+    fn read_contents() -> anyhow::Result<String> {
         let config_dir = Self::get_dir()?;
         let config_path = config_dir.join("config.yaml");
 
@@ -319,8 +467,7 @@ impl Config {
             }
         }
 
-        // Deserialize the config.yaml file
-        serde_yaml_ng::from_str(&contents).map_err(anyhow::Error::new)
+        Ok(contents)
     }
 
     pub fn get_dir() -> anyhow::Result<PathBuf> {
@@ -342,73 +489,77 @@ impl Config {
         Ok(config_dir)
     }
 
-    pub fn reload() -> anyhow::Result<()> {
-        let new_config = match Self::create() {
-            Ok(config) => {
-                BG_SERVICES.lock().unwrap().reload(&config);
-
-                let mut directx_devices_opt = APP_STATE.directx_devices.write().unwrap();
-
-                if config.render_backend == RenderBackendConfig::V2 && directx_devices_opt.is_none()
-                {
-                    let direct_x_devices = DirectXDevices::new(&APP_STATE.render_factory)
-                        .unwrap_or_else(|err| {
-                            error!("could not create directx devices: {err:#}");
-                            panic!("could not create directx devices: {err:#}");
-                        });
-
-                    *directx_devices_opt = Some(direct_x_devices);
-                } else if config.render_backend == RenderBackendConfig::Legacy
-                    && directx_devices_opt.is_some()
-                {
-                    *directx_devices_opt = None;
-                }
-
-                config
-            }
-            Err(err) => {
-                error!("could not reload config: {err:#}");
-                thread::spawn(move || {
-                    display_error_box(format!("could not reload config: {err:#}"), None);
-                });
-
-                Config::default()
-            }
+    pub fn reload() -> ReloadOutcome {
+        let new_config = match RuntimeConfig::load() {
+            Ok(config) => config,
+            Err(error) => return reject_reload(error),
         };
-        let mut sequence = APP_STATE
-            .appearance
-            .lock()
-            .map_err(|_| anyhow!("appearance gate poisoned"))?;
-        let revision = sequence.config_revision.checked_add(1).ok_or_else(|| {
-            APP_STATE
-                .border_registry
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .quarantine();
-            anyhow!("configuration revisions exhausted")
-        })?;
-        let command = sequence.next_command().ok_or_else(|| {
-            APP_STATE
-                .border_registry
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .quarantine();
-            anyhow!("appearance commands exhausted")
-        })?;
-        let mut config = APP_STATE
-            .config
-            .write()
-            .map_err(|_| anyhow!("configuration poisoned"))?;
-        *config = new_config;
-        sequence.config_revision = revision;
-        sequence.global_stamps = crate::border_updates::AppearanceStamps {
-            active: command,
-            inactive: command,
-            width: command,
-            offset: command,
-            radius: command,
+        let changed = match APP_STATE.config.read() {
+            Ok(config) => *config != new_config,
+            Err(_) => return reject_reload(anyhow!("configuration poisoned")),
         };
-        Ok(())
+        if !changed {
+            return ReloadOutcome::Applied { changed: false };
+        }
+
+        let result = (|| -> anyhow::Result<()> {
+            let mut directx_devices_opt = APP_STATE
+                .directx_devices
+                .write()
+                .map_err(|_| anyhow!("render device state poisoned"))?;
+
+            if new_config.render_backend == RenderBackendConfig::V2 && directx_devices_opt.is_none()
+            {
+                *directx_devices_opt = Some(DirectXDevices::new(&APP_STATE.render_factory)?);
+            } else if new_config.render_backend == RenderBackendConfig::Legacy
+                && directx_devices_opt.is_some()
+            {
+                *directx_devices_opt = None;
+            }
+            drop(directx_devices_opt);
+
+            BG_SERVICES.lock().unwrap().reload(new_config.source());
+
+            let mut sequence = APP_STATE
+                .appearance
+                .lock()
+                .map_err(|_| anyhow!("appearance gate poisoned"))?;
+            let revision = sequence.config_revision.checked_add(1).ok_or_else(|| {
+                APP_STATE
+                    .border_registry
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .quarantine();
+                anyhow!("configuration revisions exhausted")
+            })?;
+            let command = sequence.next_command().ok_or_else(|| {
+                APP_STATE
+                    .border_registry
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .quarantine();
+                anyhow!("appearance commands exhausted")
+            })?;
+            let mut config = APP_STATE
+                .config
+                .write()
+                .map_err(|_| anyhow!("configuration poisoned"))?;
+            *config = new_config;
+            sequence.config_revision = revision;
+            sequence.global_stamps = crate::border_updates::AppearanceStamps {
+                active: command,
+                inactive: command,
+                width: command,
+                offset: command,
+                radius: command,
+            };
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => ReloadOutcome::Applied { changed: true },
+            Err(error) => reject_reload(error),
+        }
     }
 
     pub fn is_config_watcher_enabled(&self) -> bool {
@@ -446,6 +597,13 @@ impl Config {
     pub fn is_ipc_server_enabled(&self) -> bool {
         self.enable_ipc_server
     }
+}
+
+fn reject_reload(error: anyhow::Error) -> ReloadOutcome {
+    error!("could not reload config: {error:#}");
+    let message = format!("could not reload config: {error:#}");
+    thread::spawn(move || display_error_box(message, None));
+    ReloadOutcome::Rejected(error)
 }
 
 #[derive(Debug)]
@@ -661,6 +819,136 @@ fn request_config_reload_with(submit: impl FnOnce() -> anyhow::Result<()>) -> an
 
 pub fn begin_config_reload() {
     CONFIG_RELOAD_PENDING.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::*;
+
+    fn rule(
+        kind: Option<MatchKind>,
+        name: Option<&str>,
+        strategy: Option<MatchStrategy>,
+    ) -> WindowRule {
+        WindowRule {
+            kind,
+            name: name.map(str::to_owned),
+            strategy,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolves_and_matches_all_strategies() {
+        let source = Config {
+            window_rules: vec![
+                rule(Some(MatchKind::Title), Some("EDITOR"), None),
+                rule(
+                    Some(MatchKind::Class),
+                    Some("Console"),
+                    Some(MatchStrategy::Contains),
+                ),
+                rule(
+                    Some(MatchKind::Process),
+                    Some("^Code\\.exe$"),
+                    Some(MatchStrategy::Regex),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let runtime = RuntimeConfig::from_source(source).unwrap();
+        assert!(runtime.window_rules()[0].is_match("editor"));
+        assert!(runtime.window_rules()[1].is_match("WindowsConsoleHost"));
+        assert!(runtime.window_rules()[2].is_match("Code.exe"));
+        assert!(!runtime.window_rules()[2].is_match("code.exe"));
+        assert_eq!(runtime.window_rules()[0].kind(), MatchKind::Title);
+    }
+
+    #[test]
+    fn rejects_invalid_regex_with_rule_context() {
+        for pattern in ["[", "(", "\\", "a{2,1}"] {
+            let source = Config {
+                window_rules: vec![
+                    rule(Some(MatchKind::Title), Some("valid"), None),
+                    rule(
+                        Some(MatchKind::Process),
+                        Some(pattern),
+                        Some(MatchStrategy::Regex),
+                    ),
+                ],
+                ..Default::default()
+            };
+
+            let error = RuntimeConfig::from_source(source).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("window_rules[2] (Process, Regex)"));
+            assert!(message.contains(&format!("{pattern:?}")));
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_regex() {
+        let error = RuntimeConfig::parse(
+            "window_rules:\n  - match: Title\n    name: \"[\"\n    strategy: Regex\n",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("window_rules[1] (Title, Regex)"));
+    }
+
+    #[test]
+    fn rejects_missing_required_rule_fields() {
+        let missing_kind = RuntimeConfig::from_source(Config {
+            window_rules: vec![rule(None, Some("name"), None)],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(format!("{missing_kind:#}").contains("window_rules[1].match is required"));
+
+        let missing_name = RuntimeConfig::from_source(Config {
+            window_rules: vec![rule(Some(MatchKind::Title), None, None)],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(format!("{missing_name:#}").contains("window_rules[1].name is required"));
+    }
+
+    #[test]
+    fn fallback_is_resolved_and_equality_uses_source() {
+        let fallback = RuntimeConfig::fallback();
+        assert!(fallback.window_rules().is_empty());
+        assert!(fallback.source().window_rules.is_empty());
+
+        let source = Config {
+            window_rules: vec![rule(
+                Some(MatchKind::Title),
+                Some("^title$"),
+                Some(MatchStrategy::Regex),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            RuntimeConfig::from_source(source.clone()).unwrap(),
+            RuntimeConfig::from_source(source).unwrap()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalid_update_preserves_active_runtime_config() {
+        let before = APP_STATE.config.read().unwrap().clone();
+        let result = APP_STATE.update_config(|source| {
+            source.window_rules.push(rule(
+                Some(MatchKind::Title),
+                Some("["),
+                Some(MatchStrategy::Regex),
+            ));
+        });
+
+        assert!(result.is_err());
+        assert_eq!(*APP_STATE.config.read().unwrap(), before);
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
 use anyhow::{Context, anyhow};
-use regex::Regex;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::error::Error;
@@ -36,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
-use crate::config::{EnableMode, MatchKind, MatchStrategy, WindowRule};
+use crate::config::{EnableMode, MatchKind, WindowRule};
 use crate::event_hook::handle_foreground_event;
 
 pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
@@ -549,7 +548,10 @@ pub(crate) fn shared_snapshot_error<Value>(
     ))
 }
 
-pub fn get_window_rule_from_config(hwnd: HWND, config: &crate::config::Config) -> WindowRule {
+pub fn get_window_rule_from_config(
+    hwnd: HWND,
+    config: &crate::config::RuntimeConfig,
+) -> WindowRule {
     let mut title_opt: Option<String> = None;
     let mut class_opt: Option<String> = None;
     let mut process_opt: Option<String> = None;
@@ -573,39 +575,15 @@ pub fn get_window_rule_from_config(hwnd: HWND, config: &crate::config::Config) -
         })
     };
 
-    for rule in config.window_rules.iter() {
-        let window_name: &String = match rule.kind {
-            Some(MatchKind::Title) => title_opt.get_or_insert_with(title),
-            Some(MatchKind::Class) => class_opt.get_or_insert_with(class),
-            Some(MatchKind::Process) => process_opt.get_or_insert_with(process),
-            None => {
-                error!("expected 'match' for window rule but None found!");
-                continue;
-            }
+    for rule in config.window_rules() {
+        let window_name: &String = match rule.kind() {
+            MatchKind::Title => title_opt.get_or_insert_with(title),
+            MatchKind::Class => class_opt.get_or_insert_with(class),
+            MatchKind::Process => process_opt.get_or_insert_with(process),
         };
 
-        let Some(match_name) = &rule.name else {
-            error!("expected `name` for window rule but None found!");
-            continue;
-        };
-
-        // Check if the window rule matches the window
-        let has_match = match rule.strategy {
-            Some(MatchStrategy::Equals) | None => {
-                window_name.to_lowercase().eq(&match_name.to_lowercase())
-            }
-            Some(MatchStrategy::Contains) => window_name
-                .to_lowercase()
-                .contains(&match_name.to_lowercase()),
-            Some(MatchStrategy::Regex) => Regex::new(match_name)
-                .unwrap()
-                .captures(window_name)
-                .is_some(),
-        };
-
-        // Return the first match
-        if has_match {
-            return rule.clone();
+        if rule.is_match(window_name) {
+            return rule.source().clone();
         }
     }
 
@@ -1212,7 +1190,7 @@ mod tests {
 
     struct ReconciliationFixture {
         previous_registry: crate::border_registry::BorderRegistry,
-        previous_config: crate::config::Config,
+        previous_config: crate::config::RuntimeConfig,
         window: OwnedHWND,
         identity: crate::border_registry::TrackingWindowIdentity,
         instance: crate::border_registry::BorderInstanceId,

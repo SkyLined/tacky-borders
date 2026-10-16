@@ -201,7 +201,7 @@ fn run_host_loop(
     mut hwineventhook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
     mut shutting_down: bool,
     mut receipts: Vec<(LifecycleReceipt, bool)>,
-    mut config_reload: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    mut config_reload: Option<std::thread::JoinHandle<tacky_borders::config::ReloadOutcome>>,
 ) {
     let mut stop_submitted = false;
     let mut wait_failed = false;
@@ -281,10 +281,10 @@ fn run_host_loop(
                 .is_some_and(std::thread::JoinHandle::is_finished)
                 && let Some(worker) = config_reload.take()
             {
-                let reload_succeeded = match worker.join() {
-                    Ok(Ok(())) => true,
-                    Ok(Err(error)) => {
-                        error!("config reload failed: {error:#}");
+                let reload_changed = match worker.join() {
+                    Ok(tacky_borders::config::ReloadOutcome::Applied { changed }) => changed,
+                    Ok(tacky_borders::config::ReloadOutcome::Rejected(error)) => {
+                        error!("config reload rejected: {error:#}");
                         false
                     }
                     Err(payload) => {
@@ -293,7 +293,7 @@ fn run_host_loop(
                         false
                     }
                 };
-                match config_reload_dispatch.after_completion(reload_succeeded, shutting_down) {
+                match config_reload_dispatch.after_completion(reload_changed, shutting_down) {
                     ConfigReloadCompletion::SpawnDeferred => {
                         tacky_borders::config::begin_config_reload();
                         match std::thread::Builder::new()
@@ -753,7 +753,7 @@ mod host_tests {
         let job = std::thread::spawn(move || {
             waiting.recv().unwrap();
             completed.store(true, std::sync::atomic::Ordering::Release);
-            Ok(())
+            tacky_borders::config::ReloadOutcome::Applied { changed: false }
         });
         let retiring = registry.clone();
         let unblock = std::thread::spawn(move || {

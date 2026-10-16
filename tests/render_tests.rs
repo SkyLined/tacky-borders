@@ -8,7 +8,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 
 fn prepare_v2_render_backend() -> anyhow::Result<()> {
-    APP_STATE.get_config_mut().render_backend = RenderBackendConfig::V2;
+    APP_STATE.update_config(|config| config.render_backend = RenderBackendConfig::V2)?;
     let render_factory = APP_STATE.get_render_factory();
     *APP_STATE.get_directx_devices_mut() = Some(DirectXDevices::new(render_factory)?);
 

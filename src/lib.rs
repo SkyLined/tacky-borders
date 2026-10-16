@@ -26,7 +26,7 @@ pub mod utils;
 pub mod window_border;
 
 use anyhow::{Context, anyhow};
-use config::{Config, ConfigWatcher, config_watcher_callback};
+use config::{Config, ConfigWatcher, RuntimeConfig, config_watcher_callback};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
 use render_backend::RenderBackendConfig;
@@ -135,7 +135,7 @@ pub struct AppState {
     border_registry: Arc<Mutex<border_registry::BorderRegistry>>,
     lifecycle: Mutex<Option<Arc<border_coordinator::BorderLifecycleCoordinator>>>,
     active_window: Mutex<isize>,
-    config: RwLock<Config>,
+    config: RwLock<RuntimeConfig>,
     appearance: Mutex<border_updates::AppearanceSequencer>,
     render_factory: ID2D1Factory1,
     directx_devices: RwLock<Option<DirectXDevices>>,
@@ -148,7 +148,7 @@ impl AppState {
     fn new() -> Self {
         let active_window = get_foreground_window().0 as isize;
 
-        let config = match Config::create() {
+        let config = match RuntimeConfig::load() {
             Ok(config) => config,
             Err(err) => {
                 eprintln!("could not read config: {err:#}");
@@ -156,7 +156,7 @@ impl AppState {
                     display_error_box(format!("could not read config: {err:#}"), None);
                 });
 
-                Config::default()
+                RuntimeConfig::fallback()
             }
         };
 
@@ -237,8 +237,19 @@ impl AppState {
             .collect()
     }
 
-    pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, Config> {
+    pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, RuntimeConfig> {
         self.config.write().unwrap()
+    }
+
+    pub fn update_config(&self, update: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
+        let mut config = self
+            .config
+            .write()
+            .map_err(|_| anyhow!("configuration poisoned"))?;
+        let mut source = config.source().clone();
+        update(&mut source);
+        *config = RuntimeConfig::from_source(source)?;
+        Ok(())
     }
 
     pub fn get_render_factory(&self) -> &ID2D1Factory1 {
