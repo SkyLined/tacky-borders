@@ -16,6 +16,7 @@ thread_local! {
 pub enum AnimationTimerExit {
     Stopped,
     InvalidInterval,
+    InvalidFrameRate(i32),
     SpawnFailed(String),
     PostFailed(String),
     Panicked,

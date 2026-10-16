@@ -676,7 +676,8 @@ impl BorderDrawer {
 
         self.last_anim_time = Some(time::Instant::now());
 
-        let render_interval = 1.0 / self.animations.fps as f32;
+        let render_interval =
+            crate::animations::frame_interval_for_fps(self.animations.fps)?.as_secs_f32();
         let time_diff = render_elapsed.as_secs_f32() - render_interval;
         if update && (time_diff.abs() <= 0.001 || time_diff >= 0.0) {
             self.render(bounds, window_state)?;

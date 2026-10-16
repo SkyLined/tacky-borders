@@ -231,6 +231,13 @@ pub struct ReloadCompletion {
 
 impl RuntimeConfig {
     pub fn from_source(source: Config) -> anyhow::Result<Self> {
+        source.global.animations.validate("global.animations")?;
+        for (index, rule) in source.window_rules.iter().enumerate() {
+            if let Some(animations) = &rule.animations {
+                animations.validate(&format!("window_rules[{}].animations", index + 1))?;
+            }
+        }
+
         let window_rules = source
             .window_rules
             .iter()
@@ -1271,6 +1278,78 @@ mod runtime_config_tests {
             RuntimeConfig::from_source(source.clone()).unwrap(),
             RuntimeConfig::from_source(source).unwrap()
         );
+    }
+
+    #[test]
+    fn runtime_config_validates_enabled_animation_timing() {
+        let valid = RuntimeConfig::parse(
+            "global:\n  animations:\n    enabled: true\n    fps: 1000\n    active:\n      - type: Fade\n        duration: 1.0e-45\n",
+        )
+        .unwrap();
+        assert_eq!(valid.global.animations.to_animations().fps, 1000);
+        RuntimeConfig::parse(
+            "global:\n  animations:\n    enabled: true\n    fps: 1\n    active:\n      - type: Fade\n        duration: 3.4028235e38\n",
+        )
+        .unwrap();
+
+        for (fps, duration, expected) in [
+            ("0", "200", "global.animations.fps"),
+            ("1001", "200", "global.animations.fps"),
+            ("60.5", "200", "global.animations.fps"),
+            ("not-a-number", "200", "global.animations.fps"),
+            ("60", "0", "global.animations.active[1].duration"),
+            ("60", ".nan", "global.animations.active[1].duration"),
+            ("60", ".inf", "global.animations.active[1].duration"),
+            (
+                "60",
+                "not-a-duration",
+                "global.animations.active[1].duration",
+            ),
+        ] {
+            let yaml = format!(
+                "global:\n  animations:\n    enabled: true\n    fps: {fps}\n    active:\n      - type: Fade\n        duration: {duration}\n"
+            );
+            let error = RuntimeConfig::parse(&yaml).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "error {error:#} did not mention {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_animation_timing_is_ignored_for_global_and_window_rules() {
+        let runtime = RuntimeConfig::parse(
+            "global:\n  animations:\n    enabled: false\n    fps: 0\n    active:\n      - type: Fade\n        duration: .nan\nwindow_rules:\n  - match: Title\n    name: example\n    animations:\n      enabled: false\n      fps: 1001\n      active:\n        - type: Spiral\n          duration: 0\n",
+        )
+        .unwrap();
+
+        assert!(runtime.global.animations.to_animations().active.is_empty());
+        assert!(
+            runtime.window_rules()[0]
+                .source()
+                .animations
+                .as_ref()
+                .unwrap()
+                .to_animations()
+                .active
+                .is_empty()
+        );
+
+        RuntimeConfig::parse(
+            "global:\n  animations:\n    enabled: false\n    fps: not-a-number\n    active:\n      - type: Fade\n        duration: not-a-duration\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enabled_window_rule_animation_timing_is_validated_with_context() {
+        let error = RuntimeConfig::parse(
+            "window_rules:\n  - match: Title\n    name: example\n    animations:\n      enabled: true\n      fps: 60\n      active:\n        - type: Fade\n          duration: 0\n",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("window_rules[1].animations.active[1].duration"));
     }
 
     #[test]
