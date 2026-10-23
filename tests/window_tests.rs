@@ -381,6 +381,7 @@ struct ResourceSample {
     threads: u32,
     border_workers: u32,
     animation_workers: u32,
+    animation_scheduler_workers: u32,
     working_set: usize,
     private_bytes: usize,
     cpu_seconds: f64,
@@ -534,6 +535,7 @@ impl ResourceSampler {
         let mut threads = 0;
         let mut border_workers = 0;
         let mut animation_workers = 0;
+        let mut animation_scheduler_workers = 0;
         unsafe {
             Thread32First(*snapshot, &mut entry)?;
         }
@@ -550,6 +552,8 @@ impl ResourceSampler {
                         }
                         border_workers += u32::from(name == "border-worker");
                         animation_workers += u32::from(name == "border-animation");
+                        animation_scheduler_workers +=
+                            u32::from(name == "border-animation-scheduler");
                     }
                     unsafe {
                         CloseHandle(thread)?;
@@ -574,6 +578,7 @@ impl ResourceSampler {
             threads,
             border_workers,
             animation_workers,
+            animation_scheduler_workers,
             working_set: memory.WorkingSetSize,
             private_bytes: memory.PrivateUsage,
             cpu_seconds: seconds(kernel) + seconds(user),
@@ -594,6 +599,232 @@ impl Drop for ResourceSampler {
             windows::Win32::System::Performance::PdhCloseQuery(self.query);
         }
     }
+}
+
+const ANIMATION_BENCHMARK_WINDOWS: usize = 64;
+const ANIMATION_BENCHMARK_DURATION: Duration = Duration::from_secs(20);
+
+#[test]
+#[ignore = "manual before/after animation timer resource benchmark"]
+#[serial]
+fn many_animated_borders_resource_benchmark() -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    use std::os::windows::io::AsRawHandle;
+
+    thread::scope(|scope| -> anyhow::Result<()> {
+        let mut child = StressChild(
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "many_animated_borders_resource_benchmark_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TACKY_BORDERS_ANIMATION_BENCHMARK_CHILD", "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()?,
+        );
+        let output = child.0.stdout.take().unwrap();
+        let (events, receiver) = mpsc::channel();
+        scope.spawn(move || {
+            for line in std::io::BufReader::new(output).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line)
+                    && event.get("phase").is_some()
+                {
+                    if events.send(event).is_err() {
+                        break;
+                    }
+                } else {
+                    println!("{line}");
+                }
+            }
+        });
+
+        let mut sampler = ResourceSampler::for_process(child.0.id())?;
+        let mut observations = Vec::new();
+        let mut started_at = None;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    let phase = event["phase"].as_str().unwrap();
+                    match phase {
+                        "ready" => {
+                            observations.push(("ready", sampler.sample()?));
+                        }
+                        "measurement_start" => {
+                            let sample = sampler.sample()?;
+                            anyhow::ensure!(
+                                sample.border_workers >= ANIMATION_BENCHMARK_WINDOWS as u32,
+                                "benchmark did not start all border workers: {sample:?}"
+                            );
+                            observations.push(("measurement_start", sample));
+                            started_at = Some(Instant::now());
+                        }
+                        "measurement_end" => {
+                            observations.push(("measurement_end", sampler.sample()?));
+                        }
+                        phase => anyhow::bail!("unexpected benchmark phase: {phase}"),
+                    }
+                    child.0.stdin.as_mut().unwrap().write_all(b"continue\n")?;
+                    if phase == "measurement_end" {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "animation benchmark exceeded external deadline"
+                    );
+                    if started_at.is_some() {
+                        observations.push(("during_measurement", sampler.sample()?));
+                    }
+                    if let Some(status) = child.0.try_wait()? {
+                        anyhow::bail!("animation benchmark helper exited early: {status}");
+                    }
+                    unsafe {
+                        windows::Win32::System::Threading::WaitForSingleObject(
+                            windows::Win32::Foundation::HANDLE(child.0.as_raw_handle()),
+                            10,
+                        );
+                    }
+                }
+                Err(error) => anyhow::bail!("animation benchmark helper output ended: {error}"),
+            }
+        }
+
+        let status = child.0.wait()?;
+        anyhow::ensure!(
+            status.success(),
+            "animation benchmark helper failed: {status}"
+        );
+        let elapsed = started_at.unwrap().elapsed().as_secs_f64();
+        let artifact = std::env::temp_dir().join(format!(
+            "tacky-borders-animation-benchmark-{}.json",
+            child.0.id()
+        ));
+        std::fs::write(
+            &artifact,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "windows": ANIMATION_BENCHMARK_WINDOWS,
+                "duration_seconds": elapsed,
+                "observations": observations,
+            }))?,
+        )?;
+        println!(
+            "animation_benchmark_artifact={}; duration_seconds={elapsed}; observations={observations:?}",
+            artifact.display()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "launched only by many_animated_borders_resource_benchmark"]
+fn many_animated_borders_resource_benchmark_helper() -> anyhow::Result<()> {
+    use std::io::Write;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
+    };
+
+    anyhow::ensure!(
+        std::env::var_os("TACKY_BORDERS_ANIMATION_BENCHMARK_CHILD").is_some(),
+        "benchmark helper must be launched by its parent test"
+    );
+    test_support::initialize();
+    tacky_borders::register_border_window_class()?;
+    let animations: tacky_borders::animations::AnimationsConfig =
+        serde_json::from_value(serde_json::json!({
+            "active": [{ "type": "Spiral" }],
+            "inactive": [{ "type": "Spiral" }],
+            "fps": 120,
+            "enabled": true
+        }))?;
+    tacky_borders::APP_STATE.update_config(|config| {
+        config.global.follow_native_border = false;
+        config.global.animations = animations;
+        config.global.border_z_order = tacky_borders::config::ZOrderMode::BelowWindow;
+    })?;
+
+    fn phase(phase: &str) -> anyhow::Result<()> {
+        println!("{}", serde_json::json!({"phase": phase}));
+        std::io::stdout().flush()?;
+        let mut acknowledgment = String::new();
+        std::io::stdin().read_line(&mut acknowledgment)?;
+        anyhow::ensure!(
+            acknowledgment.trim() == "continue",
+            "missing benchmark supervisor acknowledgment"
+        );
+        Ok(())
+    }
+
+    fn pump_for(cohort: &mut Cohort, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            cohort.0.service_turn();
+            let mut message = MSG::default();
+            for _ in 0..64 {
+                if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    break;
+                }
+                unsafe {
+                    DispatchMessageW(&message);
+                }
+            }
+            unsafe {
+                MsgWaitForMultipleObjectsEx(None, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
+        }
+    }
+
+    let tracking = (0..ANIMATION_BENCHMARK_WINDOWS)
+        .map(|_| TrackingWindow::new())
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for window in &tracking {
+        unsafe {
+            SetWindowPos(
+                HWND(window.hwnd as _),
+                None,
+                -32000,
+                -32000,
+                100,
+                100,
+                SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            )?;
+        }
+    }
+    let mut cohort = Cohort::new();
+    let instances = cohort.reload_many(&tracking);
+    anyhow::ensure!(
+        instances.len() == ANIMATION_BENCHMARK_WINDOWS,
+        "not all benchmark border workers started"
+    );
+
+    pump_for(&mut cohort, Duration::from_secs(8));
+    phase("ready")?;
+    phase("measurement_start")?;
+    pump_for(&mut cohort, ANIMATION_BENCHMARK_DURATION);
+    phase("measurement_end")?;
+
+    cohort.stop(OperationKind::Shutdown);
+    let mut outcomes = std::collections::HashMap::new();
+    while let Some((id, outcome)) = cohort.0.take_outcome() {
+        assert!(outcomes.insert(id, outcome.clone()).is_none());
+        assert_eq!(outcome, BorderWorkerExit::completed());
+    }
+    assert_eq!(outcomes.len(), instances.len());
+    for (id, hwnd) in instances {
+        assert!(!unsafe { IsWindow(Some(HWND(hwnd as _))) }.as_bool());
+        assert!(outcomes.contains_key(&id));
+    }
+    for window in tracking {
+        window.close()?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -802,8 +1033,12 @@ fn sustained_animated_lifecycle_resources_are_bounded() -> anyhow::Result<()> {
                 "missing retained worker: {active:?}"
             );
             assert_eq!(
-                active.animation_workers, 1,
-                "missing owned timer: {active:?}"
+                active.animation_workers, 0,
+                "per-border timer thread was spawned: {active:?}"
+            );
+            assert_eq!(
+                active.animation_scheduler_workers, 1,
+                "missing shared scheduler thread: {active:?}"
             );
             assert_eq!(
                 retired.border_workers, 0,
@@ -811,7 +1046,11 @@ fn sustained_animated_lifecycle_resources_are_bounded() -> anyhow::Result<()> {
             );
             assert_eq!(
                 retired.animation_workers, 0,
-                "timer survived retirement: {retired:?}"
+                "per-border timer thread survived retirement: {retired:?}"
+            );
+            assert_eq!(
+                retired.animation_scheduler_workers, 1,
+                "shared scheduler did not remain available: {retired:?}"
             );
         }
         for (_, retired) in &samples {
