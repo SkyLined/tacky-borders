@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::{env, iter, ptr, thread, time};
-use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, HWND};
+use windows::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, HANDLE, HWND};
 use windows::Win32::Graphics::Dwm::{
     DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
 };
@@ -1032,7 +1032,12 @@ impl ConfigWatcher {
                     None,
                     None,
                 ) {
-                    if !worker_stop_requested.load(Ordering::Acquire) {
+                    if is_expected_watcher_cancellation(
+                        &e,
+                        worker_stop_requested.load(Ordering::Acquire),
+                    ) {
+                        debug!("config watcher directory read canceled during shutdown");
+                    } else {
                         error!("could not check for changes in config dir: {e}");
                     }
                     break;
@@ -1124,6 +1129,10 @@ impl Drop for ConfigWatcher {
 
 fn is_operation_not_found(error: &windows::core::Error) -> bool {
     error.code() == ERROR_NOT_FOUND.to_hresult()
+}
+
+fn is_expected_watcher_cancellation(error: &windows::core::Error, stopping: bool) -> bool {
+    stopping && error.code() == ERROR_OPERATION_ABORTED.to_hresult()
 }
 
 fn join_or_reap_config_watcher(handle: JoinHandle<()>, cancellation_failed: bool) {
@@ -1796,6 +1805,31 @@ mod config_watcher_tests {
 
         assert!(is_operation_not_found(&expected));
         assert!(!is_operation_not_found(&unexpected));
+    }
+
+    #[test]
+    fn read_cancellation_is_expected_only_after_stop_is_requested() {
+        let aborted = windows::core::Error::from_hresult(ERROR_OPERATION_ABORTED.to_hresult());
+
+        assert!(is_expected_watcher_cancellation(&aborted, true));
+        assert!(!is_expected_watcher_cancellation(&aborted, false));
+    }
+
+    #[test]
+    fn other_read_failures_remain_unexpected_even_during_shutdown() {
+        for code in [
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+            windows::Win32::Foundation::ERROR_INVALID_HANDLE,
+            ERROR_NOT_FOUND,
+        ] {
+            let error = windows::core::Error::from_hresult(code.to_hresult());
+            for stopping in [false, true] {
+                assert!(
+                    !is_expected_watcher_cancellation(&error, stopping),
+                    "{code:?} must remain an error when stopping={stopping}"
+                );
+            }
+        }
     }
 
     #[test]
