@@ -1133,6 +1133,11 @@ impl ConfigWatcher {
                 buffer.len()
             )
         })?;
+        if returned == 0 {
+            // ReadDirectoryChangesW can discard notifications and succeed with zero bytes.
+            callback_fn();
+            return Ok(());
+        }
         if notification_contains_config(bytes, config_name)? {
             callback_fn();
         }
@@ -1588,7 +1593,6 @@ mod directory_notification_tests {
     #[test]
     fn valid_batches_match_once_regardless_of_position_or_action() {
         for names in [
-            vec![],
             vec!["other.yaml"],
             vec!["config.yaml"],
             vec!["config.yaml", "other.yaml", "config.yaml"],
@@ -1619,6 +1623,13 @@ mod directory_notification_tests {
     }
 
     #[test]
+    fn zero_returned_bytes_resynchronize_config_after_lost_notifications() {
+        let (result, callbacks) = process(&[], 0);
+        result.unwrap();
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
     fn returned_byte_count_limits_the_initialized_range() {
         let entry = record("config.yaml");
         let mut buffer = [0u8; 1024];
@@ -1627,9 +1638,6 @@ mod directory_notification_tests {
         let (result, callbacks) = process(&buffer, entry.len() as u32);
         result.unwrap();
         assert_eq!(callbacks, 1);
-        let (result, callbacks) = process(&buffer, 0);
-        result.unwrap();
-        assert_eq!(callbacks, 0);
         for count in [1025, u32::MAX] {
             let (result, callbacks) = process(&buffer, count);
             assert!(format!("{:#}", result.unwrap_err()).contains("exceeds buffer"));
