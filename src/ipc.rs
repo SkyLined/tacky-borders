@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use windows::Win32::Networking::WinSock::{WSAECONNABORTED, WSAECONNRESET};
 
 use crate::APP_STATE;
 use crate::border_registry::{BorderRegistry, TrackingWindowFingerprint};
@@ -429,48 +430,100 @@ fn run_acceptor(
 ) {
     debug!("entering ipc acceptor thread");
     let mut last_overload_log = Instant::now();
+    let mut transient_errors = 0u64;
 
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
+    run_accept_loop(
+        &stop,
+        || listener.accept(),
+        |stream| {
+            if let Err(error) = stream.set_nonblocking(false) {
+                error!("could not make accepted ipc client blocking: {error}");
+                return;
+            }
+            match queue.try_push(stream) {
+                PushResult::Queued => {}
+                PushResult::Full(_) | PushResult::Closed(_) => {
+                    rejected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        },
+        |kind, error| {
+            if kind == AcceptErrorKind::TransientConnection {
+                transient_errors = transient_errors.saturating_add(1);
+            }
+            if last_overload_log.elapsed() >= IPC_OVERLOAD_LOG_INTERVAL {
+                let rejected_count = rejected.swap(0, Ordering::Relaxed);
+                if rejected_count != 0 {
+                    warn!("rejected {rejected_count} ipc clients while the worker queue was full");
+                }
+                if transient_errors != 0 {
+                    warn!(
+                        "ignored {transient_errors} transient ipc accept errors; latest error: {error}"
+                    );
+                }
+                transient_errors = 0;
+                last_overload_log = Instant::now();
+            }
+        },
+        |error| {
+            if !stop.load(Ordering::Acquire) {
+                error!("could not accept ipc client: {error}");
+            }
+        },
+        thread::park_timeout,
+    );
+
+    debug!("exiting ipc acceptor thread");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptErrorKind {
+    WouldBlock,
+    TransientConnection,
+    Fatal,
+}
+
+fn classify_accept_error(error: &std::io::Error) -> AcceptErrorKind {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return AcceptErrorKind::WouldBlock;
+    }
+
+    match error.raw_os_error() {
+        Some(code) if code == WSAECONNABORTED.0 || code == WSAECONNRESET.0 => {
+            AcceptErrorKind::TransientConnection
         }
+        _ => AcceptErrorKind::Fatal,
+    }
+}
 
-        match listener.accept() {
-            Ok(stream) => {
+fn run_accept_loop<T>(
+    stop: &AtomicBool,
+    mut accept: impl FnMut() -> std::io::Result<T>,
+    mut on_accept: impl FnMut(T),
+    mut on_retry: impl FnMut(AcceptErrorKind, &std::io::Error),
+    mut on_fatal: impl FnMut(std::io::Error),
+    mut wait: impl FnMut(Duration),
+) {
+    while !stop.load(Ordering::Acquire) {
+        match accept() {
+            Ok(value) => {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                if let Err(error) = stream.set_nonblocking(false) {
-                    error!("could not make accepted ipc client blocking: {error}");
-                    continue;
-                }
-                match queue.try_push(stream) {
-                    PushResult::Queued => {}
-                    PushResult::Full(_) | PushResult::Closed(_) => {
-                        rejected.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                on_accept(value);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if last_overload_log.elapsed() >= IPC_OVERLOAD_LOG_INTERVAL {
-                    let count = rejected.swap(0, Ordering::Relaxed);
-                    if count != 0 {
-                        warn!("rejected {count} ipc clients while the worker queue was full");
-                    }
-                    last_overload_log = Instant::now();
+            Err(error) => match classify_accept_error(&error) {
+                kind @ (AcceptErrorKind::WouldBlock | AcceptErrorKind::TransientConnection) => {
+                    on_retry(kind, &error);
+                    wait(IPC_ACCEPT_POLL_INTERVAL);
                 }
-                thread::park_timeout(IPC_ACCEPT_POLL_INTERVAL);
-            }
-            Err(error) => {
-                if !stop.load(Ordering::Acquire) {
-                    error!("could not accept ipc client: {error}");
+                AcceptErrorKind::Fatal => {
+                    on_fatal(error);
+                    break;
                 }
-                break;
-            }
+            },
         }
     }
-
-    debug!("exiting ipc acceptor thread");
 }
 
 fn join_threads(handles: &mut Vec<JoinHandle<()>>, description: &str) {
@@ -1194,6 +1247,68 @@ mod tests {
             "tacky-borders-ipc-{name}-{}-{id}.sock",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn accept_loop_retries_reset_connections_before_dispatching_next_client() {
+        let stop = AtomicBool::new(false);
+        let attempts = AtomicUsize::new(0);
+        let retry_kinds = Mutex::new(Vec::new());
+        let dispatched = AtomicUsize::new(0);
+
+        run_accept_loop(
+            &stop,
+            || match attempts.fetch_add(1, Ordering::Relaxed) {
+                0 => Err(io::Error::from_raw_os_error(WSAECONNRESET.0)),
+                1 => Err(io::Error::from_raw_os_error(WSAECONNABORTED.0)),
+                _ => Ok("healthy client"),
+            },
+            |client| {
+                assert_eq!(client, "healthy client");
+                dispatched.fetch_add(1, Ordering::Relaxed);
+                stop.store(true, Ordering::Release);
+            },
+            |kind, _| retry_kinds.lock().unwrap().push(kind),
+            |error| panic!("transient accept error became fatal: {error}"),
+            |_| {},
+        );
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *retry_kinds.lock().unwrap(),
+            [
+                AcceptErrorKind::TransientConnection,
+                AcceptErrorKind::TransientConnection
+            ]
+        );
+    }
+
+    #[test]
+    fn accept_loop_waits_after_would_block_and_stops_on_fatal_error() {
+        let stop = AtomicBool::new(false);
+        let attempts = AtomicUsize::new(0);
+        let waits = Mutex::new(Vec::new());
+        let fatal = Mutex::new(None);
+
+        run_accept_loop(
+            &stop,
+            || match attempts.fetch_add(1, Ordering::Relaxed) {
+                0 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "listener failure",
+                )),
+            },
+            |_: ()| panic!("unexpected accepted client"),
+            |kind, _| waits.lock().unwrap().push(kind),
+            |error| *fatal.lock().unwrap() = Some(error.to_string()),
+            |delay| assert_eq!(delay, IPC_ACCEPT_POLL_INTERVAL),
+        );
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*waits.lock().unwrap(), [AcceptErrorKind::WouldBlock]);
+        assert_eq!(fatal.lock().unwrap().as_deref(), Some("listener failure"));
     }
 
     #[test]
