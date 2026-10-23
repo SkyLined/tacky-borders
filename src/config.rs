@@ -17,15 +17,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
-use std::{env, iter, ptr, slice, thread, time};
+use std::{env, iter, ptr, thread, time};
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, HWND};
 use windows::Win32::Graphics::Dwm::{
     DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    ReadDirectoryChangesW,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows::Win32::System::IO::CancelIoEx;
 use windows::core::PCWSTR;
@@ -890,6 +889,81 @@ pub struct ConfigWatcher {
     thread_handle: Option<JoinHandle<()>>,
 }
 
+const FILE_NOTIFY_HEADER_BYTES: usize = 12;
+
+// ReadDirectoryChangesW requires a DWORD-aligned output buffer.
+#[repr(align(4))]
+struct DirectoryNotificationBuffer([u8; 1024]);
+
+fn notification_end(start: usize, length: usize, field: &str) -> anyhow::Result<usize> {
+    start.checked_add(length).with_context(|| {
+        format!("directory notification at byte {start}: {field} {length} overflows")
+    })
+}
+
+fn notification_contains_config(bytes: &[u8], config_name: &str) -> anyhow::Result<bool> {
+    let mut offset = 0;
+    let mut changed = false;
+    while offset < bytes.len() {
+        let header_end = notification_end(offset, FILE_NOTIFY_HEADER_BYTES, "header length")?;
+        let header = bytes.get(offset..header_end).with_context(|| {
+            format!(
+                "directory notification at byte {offset}: truncated header in {} returned bytes",
+                bytes.len()
+            )
+        })?;
+        let next = usize::try_from(u32::from_ne_bytes(header[..4].try_into()?))?;
+        let name_length = usize::try_from(u32::from_ne_bytes(header[8..12].try_into()?))?;
+        anyhow::ensure!(
+            name_length.is_multiple_of(2),
+            "directory notification at byte {offset}: odd FileNameLength {name_length}"
+        );
+        let record_end = if next == 0 {
+            bytes.len()
+        } else {
+            anyhow::ensure!(
+                next >= FILE_NOTIFY_HEADER_BYTES && next.is_multiple_of(4),
+                "directory notification at byte {offset}: invalid NextEntryOffset {next}"
+            );
+            let end = notification_end(offset, next, "NextEntryOffset")?;
+            anyhow::ensure!(
+                end < bytes.len(),
+                "directory notification at byte {offset}: NextEntryOffset {next} \
+                 leaves no next record in {} returned bytes",
+                bytes.len()
+            );
+            end
+        };
+        let name_end = notification_end(header_end, name_length, "FileNameLength")?;
+        anyhow::ensure!(
+            name_end <= record_end,
+            "directory notification at byte {offset}: FileNameLength {name_length} \
+             exceeds record ending at byte {record_end} in {} returned bytes",
+            bytes.len()
+        );
+        let name_units = bytes[header_end..name_end]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let name = String::from_utf16(&name_units).with_context(|| {
+            format!("directory notification at byte {offset}: invalid UTF-16 filename")
+        })?;
+        changed |= name == config_name;
+        if next == 0 {
+            let padding = (4 - name_end % 4) % 4;
+            anyhow::ensure!(
+                bytes.len() - name_end <= padding,
+                "directory notification at byte {offset}: excess trailing bytes after filename"
+            );
+            break;
+        }
+        offset = record_end;
+    }
+    Ok(changed)
+}
+
 impl ConfigWatcher {
     pub fn new(
         config_path: PathBuf,
@@ -940,7 +1014,7 @@ impl ConfigWatcher {
             // Reconvert isize back to HANDLE
             let dir_handle = HANDLE(dir_handle_isize as _);
 
-            let mut buffer = [0u8; 1024];
+            let mut buffer = DirectoryNotificationBuffer([0u8; 1024]);
             let mut bytes_returned = 0u32;
 
             loop {
@@ -950,8 +1024,8 @@ impl ConfigWatcher {
 
                 if let Err(e) = ReadDirectoryChangesW(
                     dir_handle,
-                    buffer.as_mut_ptr() as _,
-                    buffer.len() as u32,
+                    buffer.0.as_mut_ptr() as _,
+                    buffer.0.len() as u32,
                     false,
                     FILE_NOTIFY_CHANGE_LAST_WRITE,
                     Some(ptr::addr_of_mut!(bytes_returned)),
@@ -968,7 +1042,14 @@ impl ConfigWatcher {
                     break;
                 }
 
-                Self::process_dir_change_notifs(&buffer, bytes_returned, &config_name, callback_fn);
+                if let Err(error) = Self::process_dir_change_notifs(
+                    &buffer.0,
+                    bytes_returned,
+                    &config_name,
+                    callback_fn,
+                ) {
+                    error!("could not parse config directory notifications: {error:#}");
+                }
 
                 if worker_stop_requested.load(Ordering::Acquire) {
                     break;
@@ -994,36 +1075,24 @@ impl ConfigWatcher {
         })
     }
 
-    pub fn process_dir_change_notifs(
-        buffer: &[u8; 1024],
+    fn process_dir_change_notifs(
+        buffer: &[u8],
         bytes_returned: u32,
         config_name: &str,
-        callback_fn: fn(),
-    ) {
-        let mut offset = 0usize;
-
-        while offset < bytes_returned as usize {
-            let info = unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION) };
-
-            // We divide FileNameLength by 2 because it's in bytes (u8), but FileName is in u16
-            let name_slice = unsafe {
-                slice::from_raw_parts(info.FileName.as_ptr(), info.FileNameLength as usize / 2)
-            };
-            let file_name = String::from_utf16_lossy(name_slice);
-            debug!("file changed: {file_name}");
-
-            if file_name == *config_name {
-                callback_fn();
-                break; // Prevent multiple callbacks from the same notification
-            }
-
-            // If NextEntryOffset = 0, then we have reached the end of the notification
-            if info.NextEntryOffset == 0 {
-                break;
-            } else {
-                offset += info.NextEntryOffset as usize
-            }
+        callback_fn: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        let returned = usize::try_from(bytes_returned)
+            .context("directory notification byte count does not fit usize")?;
+        let bytes = buffer.get(..returned).with_context(|| {
+            format!(
+                "directory notification byte count {returned} exceeds buffer length {}",
+                buffer.len()
+            )
+        })?;
+        if notification_contains_config(bytes, config_name)? {
+            callback_fn();
         }
+        Ok(())
     }
 }
 
@@ -1409,6 +1478,209 @@ mod reload_plan_tests {
             prepare_renderer_plan(true, false, || anyhow::bail!("injected renderer failure"));
 
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod directory_notification_tests {
+    use super::*;
+
+    fn record(name: &str) -> Vec<u8> {
+        let units = name.encode_utf16().collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_ne_bytes());
+        bytes.extend_from_slice(&3u32.to_ne_bytes());
+        bytes.extend_from_slice(&(units.len() as u32 * 2).to_ne_bytes());
+        for unit in units {
+            bytes.extend_from_slice(&unit.to_ne_bytes());
+        }
+        bytes
+    }
+
+    fn set_field(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn batch(names: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let mut entry = record(name);
+            if index + 1 < names.len() {
+                entry.resize(entry.len().next_multiple_of(4), 0);
+                let next = entry.len() as u32;
+                set_field(&mut entry, 0, next);
+            }
+            bytes.extend(entry);
+        }
+        bytes
+    }
+
+    fn process(bytes: &[u8], returned: u32) -> (anyhow::Result<()>, usize) {
+        let mut callbacks = 0;
+        let result =
+            ConfigWatcher::process_dir_change_notifs(bytes, returned, "config.yaml", || {
+                callbacks += 1
+            });
+        (result, callbacks)
+    }
+
+    #[test]
+    fn valid_batches_match_once_regardless_of_position_or_action() {
+        for names in [
+            vec![],
+            vec!["other.yaml"],
+            vec!["config.yaml"],
+            vec!["config.yaml", "other.yaml", "config.yaml"],
+            vec!["other.yaml", "config.yaml", "another.yaml"],
+            vec!["other.yaml", "another.yaml", "config.yaml"],
+        ] {
+            let bytes = batch(&names);
+            let (result, callbacks) = process(&bytes, bytes.len() as u32);
+            result.unwrap();
+            assert_eq!(callbacks, usize::from(names.contains(&"config.yaml")));
+        }
+
+        let mut bytes = record("config.yaml");
+        set_field(&mut bytes, 4, u32::MAX);
+        assert!(notification_contains_config(&bytes, "config.yaml").unwrap());
+        assert!(notification_contains_config(&record(""), "").unwrap());
+        assert!(notification_contains_config(&record("配置-😀.yaml"), "配置-😀.yaml").unwrap());
+    }
+
+    #[test]
+    fn unaligned_byte_slice_and_terminal_padding_are_supported() {
+        let mut bytes = vec![0];
+        bytes.extend(record("config.yaml"));
+        let end = bytes.len();
+        assert!(notification_contains_config(&bytes[1..], "config.yaml").unwrap());
+        bytes.resize(1 + (end - 1).next_multiple_of(4), 0xAB);
+        assert!(notification_contains_config(&bytes[1..], "config.yaml").unwrap());
+    }
+
+    #[test]
+    fn returned_byte_count_limits_the_initialized_range() {
+        let entry = record("config.yaml");
+        let mut buffer = [0u8; 1024];
+        buffer[..entry.len()].copy_from_slice(&entry);
+        buffer[entry.len()..].fill(0xFF);
+        let (result, callbacks) = process(&buffer, entry.len() as u32);
+        result.unwrap();
+        assert_eq!(callbacks, 1);
+        let (result, callbacks) = process(&buffer, 0);
+        result.unwrap();
+        assert_eq!(callbacks, 0);
+        for count in [1025, u32::MAX] {
+            let (result, callbacks) = process(&buffer, count);
+            assert!(format!("{:#}", result.unwrap_err()).contains("exceeds buffer"));
+            assert_eq!(callbacks, 0);
+        }
+    }
+
+    #[test]
+    fn every_truncated_header_is_rejected_without_callback() {
+        for length in 1..FILE_NOTIFY_HEADER_BYTES {
+            let bytes = vec![0; length];
+            let (result, callbacks) = process(&bytes, length as u32);
+            assert!(format!("{:#}", result.unwrap_err()).contains("truncated header"));
+            assert_eq!(callbacks, 0);
+        }
+    }
+
+    #[test]
+    fn malformed_names_offsets_and_trailing_data_are_rejected() {
+        let mut cases = Vec::new();
+        for length in [1, 3, 24, u32::MAX - 1, u32::MAX] {
+            let mut bytes = record("config.yaml");
+            set_field(&mut bytes, 8, length);
+            cases.push(bytes);
+        }
+        let mut truncated = record("config.yaml");
+        truncated.pop();
+        cases.push(truncated);
+
+        for next in [
+            1,
+            4,
+            8,
+            12,
+            13,
+            16,
+            32,
+            34,
+            36,
+            1024,
+            u32::MAX - 3,
+            u32::MAX,
+        ] {
+            let mut bytes = record("config.yaml");
+            set_field(&mut bytes, 0, next);
+            cases.push(bytes);
+        }
+        let mut invalid_utf16 = record("a");
+        invalid_utf16[12..14].copy_from_slice(&0xD800u16.to_ne_bytes());
+        cases.push(invalid_utf16);
+
+        let mut excess_padding = record("config.yaml");
+        excess_padding.resize(excess_padding.len().next_multiple_of(4) + 1, 0);
+        cases.push(excess_padding);
+        for bytes in cases {
+            let (result, callbacks) = process(&bytes, bytes.len() as u32);
+            assert!(result.is_err(), "accepted malformed bytes: {bytes:?}");
+            assert_eq!(callbacks, 0);
+        }
+    }
+
+    #[test]
+    fn matching_record_does_not_hide_malformed_later_records() {
+        let valid = batch(&["config.yaml", "other.yaml"]);
+        let second = u32::from_ne_bytes(valid[..4].try_into().unwrap()) as usize;
+        for length in 0..FILE_NOTIFY_HEADER_BYTES {
+            let bytes = &valid[..second + length];
+            let (result, callbacks) = process(bytes, bytes.len() as u32);
+            assert!(result.is_err());
+            assert_eq!(callbacks, 0);
+        }
+        let mut malformed = valid.clone();
+        set_field(&mut malformed, second + 8, u32::MAX);
+        let (result, callbacks) = process(&malformed, malformed.len() as u32);
+        assert!(result.is_err());
+        assert_eq!(callbacks, 0);
+
+        let (result, callbacks) = process(&valid, valid.len() as u32);
+        result.unwrap();
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn offset_arithmetic_rejects_overflow() {
+        for field in ["header length", "FileNameLength", "NextEntryOffset"] {
+            assert!(notification_end(usize::MAX, 1, field).is_err());
+            assert!(notification_end(1, usize::MAX, field).is_err());
+            assert_eq!(notification_end(0, 12, field).unwrap(), 12);
+        }
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic_or_invoke_callback_on_error() {
+        let mut seed = 0x12345678u32;
+        for length in 0..=1024 {
+            let mut bytes = vec![0; length];
+            for byte in &mut bytes {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (seed >> 24) as u8;
+            }
+            let (result, callbacks) = process(&bytes, length as u32);
+            if result.is_err() {
+                assert_eq!(callbacks, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_output_buffer_is_dword_aligned() {
+        assert!(std::mem::align_of::<DirectoryNotificationBuffer>() >= 4);
+        let buffer = DirectoryNotificationBuffer([0; 1024]);
+        assert_eq!(buffer.0.as_ptr() as usize % 4, 0);
     }
 }
 
