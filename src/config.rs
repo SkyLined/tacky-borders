@@ -24,8 +24,9 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows::Win32::System::IO::CancelIoEx;
 use windows::core::PCWSTR;
@@ -1066,7 +1067,7 @@ impl ConfigWatcher {
                     buffer.0.as_mut_ptr() as _,
                     buffer.0.len() as u32,
                     false,
-                    FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
                     Some(ptr::addr_of_mut!(bytes_returned)),
                     None,
                     None,
@@ -1825,6 +1826,25 @@ mod config_watcher_tests {
         drop(watcher);
 
         assert!(started.elapsed() < time::Duration::from_secs(2));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_replacement_triggers_callback() {
+        let _guard = CONFIG_WATCHER_TEST.lock().unwrap();
+        CALLBACK_COUNT.store(0, Ordering::Release);
+        let directory = test_directory("atomic-replacement");
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.yaml");
+        let replacement_path = directory.join("config.yaml.tmp");
+        fs::write(&config_path, "watch_config_changes: true\n").unwrap();
+        let watcher = ConfigWatcher::new(config_path.clone(), 10, counting_callback).unwrap();
+
+        fs::write(&replacement_path, "watch_config_changes: false\n").unwrap();
+        fs::rename(&replacement_path, &config_path).unwrap();
+        wait_until(|| CALLBACK_COUNT.load(Ordering::Acquire) > 0);
+
+        drop(watcher);
         fs::remove_dir_all(directory).unwrap();
     }
 
