@@ -14,6 +14,7 @@ use crate::APP_STATE;
 use crate::border_registry::{BorderRegistry, TrackingWindowFingerprint};
 use crate::border_updates::{AppearanceSequencer, IpcUpdate};
 use crate::colors::ColorBrushConfig;
+use crate::command_context::CommandContext;
 use crate::config::{
     Config, OffsetConfig, RadiusConfig, ReloadOutcome, RuntimeConfig, WidthConfig,
 };
@@ -31,7 +32,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_COMMANDS_PER_CONNECTION: usize = 32;
 const IPC_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const IPC_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const IPC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const IPC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const CLI_COMMAND_TIMEOUT: Duration =
+    IPC_CONNECTION_TIMEOUT.saturating_add(Duration::from_secs(5));
 const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
@@ -61,6 +64,56 @@ impl Default for IpcLimits {
 
 pub fn socket_path() -> anyhow::Result<PathBuf> {
     Config::get_dir().map(|dir| dir.join("tacky-borders.sock"))
+}
+
+pub fn send_command_to(path: &Path, command: &str, timeout: Duration) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        command.len() <= MAX_COMMAND_BYTES,
+        "ipc command exceeds the byte limit"
+    );
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("CLI deadline overflow")?;
+    let stream = UnixStream::connect_timeout(path, timeout).with_context(|| {
+        format!(
+            "could not connect to {}; is the ipc server enabled?",
+            path.display()
+        )
+    })?;
+    write_response(
+        &stream,
+        command.to_owned(),
+        IpcLimits {
+            max_response_bytes: MAX_COMMAND_BYTES,
+            write_timeout: timeout,
+            ..IpcLimits::default()
+        },
+        deadline,
+        &AtomicBool::new(false),
+    )
+    .context("could not send command")?;
+    let mut reader = BufReader::new(&stream);
+    let response = read_bounded_command(
+        &mut reader,
+        MAX_RESPONSE_BYTES,
+        || {
+            let duration = remaining(deadline, "CLI response")?;
+            stream
+                .set_read_timeout(duration.min(IPC_SOCKET_POLL_INTERVAL))
+                .map_err(CommandReadError::Io)
+        },
+        || {},
+    )
+    .map_err(|error| match error {
+        CommandReadError::Deadline(_) => anyhow::anyhow!("timed out waiting for IPC response"),
+        other => anyhow::Error::new(other).context("could not read IPC response"),
+    })?;
+    match response {
+        CommandRead::Command(bytes) => {
+            String::from_utf8(bytes).context("IPC response is not valid UTF-8")
+        }
+        CommandRead::Eof => anyhow::bail!("IPC server closed without a response"),
+    }
 }
 
 /// IPC Server that handles communication between a CLI and daemon.
@@ -340,6 +393,15 @@ fn run_worker(
     active: Arc<ActiveClients>,
     stop: Arc<AtomicBool>,
 ) {
+    run_worker_with(queue, active, stop, handle_client)
+}
+
+fn run_worker_with(
+    queue: Arc<ClientQueue<UnixStream>>,
+    active: Arc<ActiveClients>,
+    stop: Arc<AtomicBool>,
+    mut handle: impl FnMut(&UnixStream, &Arc<AtomicBool>) -> anyhow::Result<()>,
+) {
     while let Some(stream) = queue.pop() {
         if stop.load(Ordering::Acquire) {
             break;
@@ -349,7 +411,7 @@ fn run_worker(
             break;
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_client(&client.stream, &stop)
+            handle(&client.stream, &stop)
         }));
         match result {
             Ok(Ok(())) => {}
@@ -421,7 +483,7 @@ fn join_threads(handles: &mut Vec<JoinHandle<()>>, description: &str) {
 
 #[cfg(test)]
 pub(crate) fn handle_test_client(stream: UnixStream) -> anyhow::Result<()> {
-    handle_client(&stream, &AtomicBool::new(false))
+    handle_client(&stream, &Arc::new(AtomicBool::new(false)))
 }
 
 enum CommandRead {
@@ -518,14 +580,23 @@ fn remaining(deadline: Instant, name: &'static str) -> Result<Duration, CommandR
         .ok_or(CommandReadError::Deadline(name))
 }
 
-fn handle_client(stream: &UnixStream, stop: &AtomicBool) -> anyhow::Result<()> {
+fn handle_client(stream: &UnixStream, stop: &Arc<AtomicBool>) -> anyhow::Result<()> {
     handle_client_with_limits(stream, IpcLimits::default(), stop)
 }
 
 fn handle_client_with_limits(
     stream: &UnixStream,
     limits: IpcLimits,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    handle_client_with_processor(stream, limits, stop, process_command)
+}
+
+fn handle_client_with_processor(
+    stream: &UnixStream,
+    limits: IpcLimits,
+    stop: &Arc<AtomicBool>,
+    mut process: impl FnMut(&str, &CommandContext) -> CommandResponse,
 ) -> anyhow::Result<()> {
     let connection_deadline = Instant::now()
         .checked_add(limits.connection_timeout)
@@ -599,7 +670,8 @@ fn handle_client_with_limits(
         }
 
         remaining(connection_deadline, "connection")?;
-        let response = process_command(trimmed);
+        let context = CommandContext::new(connection_deadline, stop.clone());
+        let response = process(trimmed, &context);
         let write_result = write_response(stream, response.body, limits, connection_deadline, stop);
         if let Some(acknowledgement) = response.acknowledgement {
             let _ = acknowledgement.send(());
@@ -741,45 +813,57 @@ impl CommandResponse {
     }
 }
 
-fn process_command(raw: &str) -> CommandResponse {
+fn process_command(raw: &str, context: &CommandContext) -> CommandResponse {
+    match execute_command(raw, context) {
+        Ok(response) => response,
+        Err(error) => {
+            CommandResponse::plain(json!({"ok": false, "error": format!("{error:#}")}).to_string())
+        }
+    }
+}
+
+fn execute_command(raw: &str, context: &CommandContext) -> anyhow::Result<CommandResponse> {
+    context.check()?;
     let command: IpcCommand = match serde_json::from_str(raw) {
         Ok(command) => command,
         Err(err) => {
-            return CommandResponse::plain(
+            return Ok(CommandResponse::plain(
                 json!({"ok": false, "error": format!("invalid command: {err}")}).to_string(),
-            );
+            ));
         }
     };
 
-    match command {
+    context.check()?;
+    Ok(match command {
         IpcCommand::SetColor {
             active,
             inactive,
             focused,
         } => {
             if active.is_none() && inactive.is_none() {
-                return CommandResponse::plain(
+                return Ok(CommandResponse::plain(
                     json!({"ok": false, "error": "no colors provided"}).to_string(),
-                );
+                ));
             }
             CommandResponse::plain(apply_update(
                 IpcUpdate::Colors { active, inactive },
                 focused,
+                context,
             ))
         }
         IpcCommand::SetWidth { width, focused } => {
-            CommandResponse::plain(apply_update(IpcUpdate::Width(width), focused))
+            CommandResponse::plain(apply_update(IpcUpdate::Width(width), focused, context))
         }
         IpcCommand::SetOffset { offset, focused } => {
-            CommandResponse::plain(apply_update(IpcUpdate::Offset(offset), focused))
+            CommandResponse::plain(apply_update(IpcUpdate::Offset(offset), focused, context))
         }
         IpcCommand::SetRadius { radius, focused } => {
-            CommandResponse::plain(apply_update(IpcUpdate::Radius(radius), focused))
+            CommandResponse::plain(apply_update(IpcUpdate::Radius(radius), focused, context))
         }
-        IpcCommand::Reload => reload_from_host(),
+        IpcCommand::Reload => reload_from_host(context),
         IpcCommand::GetState => {
             let (active_color, inactive_color, border_width, border_offset, border_radius) = {
-                let config = APP_STATE.config.read().unwrap();
+                let config = context.read(&APP_STATE.config, "configuration")?;
                 (
                     config.global.active_color.clone(),
                     config.global.inactive_color.clone(),
@@ -789,10 +873,11 @@ fn process_command(raw: &str) -> CommandResponse {
                 )
             };
             let active_window = {
-                let isize = *APP_STATE.active_window.lock().unwrap();
+                let isize = *context.lock(&APP_STATE.active_window, "active window")?;
                 format!("{isize:#x}")
             };
-            let border_count = APP_STATE.border_windows().len();
+            let border_count = APP_STATE.border_windows(context)?.len();
+            context.check()?;
 
             CommandResponse::plain(
                 json!({
@@ -808,19 +893,19 @@ fn process_command(raw: &str) -> CommandResponse {
                 .to_string(),
             )
         }
-    }
+    })
 }
 
-fn reload_from_host() -> CommandResponse {
+fn reload_from_host(context: &CommandContext) -> CommandResponse {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    if let Err(error) = crate::submit_ipc_reload(sender) {
+    if let Err(error) = crate::submit_ipc_reload(sender, context) {
         return CommandResponse::plain(
             json!({"ok": false, "changed": false, "error": format!("reload request rejected: {error:#}")})
                 .to_string(),
         );
     }
 
-    match receiver.recv_timeout(IPC_COMMAND_TIMEOUT) {
+    match wait_for_reload(&receiver, context) {
         Ok(reply) => {
             let body = match reply.outcome {
                 ReloadOutcome::Applied {
@@ -845,6 +930,27 @@ fn reload_from_host() -> CommandResponse {
             json!({"ok": false, "changed": false, "error": format!("reload coordinator unavailable: {error}")})
                 .to_string(),
         ),
+    }
+}
+
+fn wait_for_reload(
+    receiver: &std::sync::mpsc::Receiver<crate::IpcReloadResponse>,
+    context: &CommandContext,
+) -> anyhow::Result<crate::IpcReloadResponse> {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(5)) {
+            Ok(reply) => break Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("reload owner disconnected"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = context.check()
+                    && (context.cancel_before_commit() || !context.is_committed())
+                {
+                    return Err(error);
+                }
+            }
+        }
     }
 }
 
@@ -878,7 +984,7 @@ enum TargetSelection {
     Focused(Option<TrackingWindowFingerprint>),
 }
 
-fn apply_update(update: IpcUpdate, focused: bool) -> String {
+fn apply_update(update: IpcUpdate, focused: bool, context: &CommandContext) -> String {
     let selection = if focused {
         TargetSelection::Focused(TrackingWindowFingerprint::capture(get_foreground_window()))
     } else {
@@ -891,6 +997,7 @@ fn apply_update(update: IpcUpdate, focused: bool) -> String {
         &APP_STATE.border_registry,
         selection,
         update,
+        context,
     ) {
         Ok(report) => report.response(),
         Err(error) => json!({"ok": false, "partial": false, "config_changed": false, "intended_targets": 0, "accepted_targets": 0, "failed_targets": 0, "error": format!("setter rejected: {error:#}")}).to_string(),
@@ -905,7 +1012,15 @@ fn broadcast_update(
     selection: TargetSelection,
     update: IpcUpdate,
 ) -> anyhow::Result<IpcDeliveryReport> {
-    broadcast_update_inner(gate, config, None, registry, selection, update)
+    broadcast_update_inner(
+        gate,
+        config,
+        None,
+        registry,
+        selection,
+        update,
+        &CommandContext::default(),
+    )
 }
 
 fn broadcast_update_with_generation(
@@ -915,6 +1030,7 @@ fn broadcast_update_with_generation(
     registry: &Mutex<BorderRegistry>,
     selection: TargetSelection,
     update: IpcUpdate,
+    context: &CommandContext,
 ) -> anyhow::Result<IpcDeliveryReport> {
     broadcast_update_inner(
         gate,
@@ -923,6 +1039,7 @@ fn broadcast_update_with_generation(
         registry,
         selection,
         update,
+        context,
     )
 }
 
@@ -933,29 +1050,45 @@ fn broadcast_update_inner(
     registry: &Mutex<BorderRegistry>,
     selection: TargetSelection,
     update: IpcUpdate,
+    context: &CommandContext,
 ) -> anyhow::Result<IpcDeliveryReport> {
-    let mut sequence = gate
-        .lock()
-        .map_err(|_| anyhow::anyhow!("appearance gate poisoned"))?;
+    let mut sequence = context.lock(gate, "appearance gate")?;
+    let mut config = if matches!(selection, TargetSelection::All) {
+        Some(context.write(config, "configuration")?)
+    } else {
+        None
+    };
+    let mut registry_guard = context.lock(registry, "border registry")?;
+    let targets = registry_guard
+        .entries
+        .values()
+        .filter(|entry| match selection {
+            TargetSelection::All => true,
+            TargetSelection::Focused(fingerprint) => {
+                fingerprint == Some(entry.tracking.fingerprint)
+                    && registry_guard
+                        .current_by_hwnd
+                        .get(&entry.tracking.fingerprint.hwnd)
+                        == Some(&entry.id)
+            }
+        })
+        .map(|entry| entry.updates.clone())
+        .collect::<Vec<_>>();
+    let admissions = targets
+        .iter()
+        .map(|mailbox| mailbox.admit(context))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    context.begin_commit()?;
     let command = sequence.next_command().ok_or_else(|| {
-        registry
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .quarantine();
+        registry_guard.quarantine();
         anyhow::anyhow!("appearance command IDs exhausted")
     })?;
     let mut report = IpcDeliveryReport::default();
     if matches!(selection, TargetSelection::All) {
         let revision = sequence.config_revision.checked_add(1).ok_or_else(|| {
-            registry
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .quarantine();
+            registry_guard.quarantine();
             anyhow::anyhow!("configuration revisions exhausted")
         })?;
-        let mut config = config
-            .write()
-            .map_err(|_| anyhow::anyhow!("configuration poisoned"))?;
         if let Some(config_generation) = config_generation {
             config_generation
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
@@ -963,7 +1096,10 @@ fn broadcast_update_inner(
                 })
                 .map_err(|_| anyhow::anyhow!("configuration generations exhausted"))?;
         }
-        let global = config.global_mut();
+        let global = config
+            .as_mut()
+            .expect("global selection holds config")
+            .global_mut();
         match &update {
             IpcUpdate::Colors { active, inactive } => {
                 if let Some(color) = active {
@@ -996,35 +1132,10 @@ fn broadcast_update_inner(
         sequence.config_revision = revision;
         report.config_accepted = true;
     }
-    let targets = {
-        let registry = match registry.lock() {
-            Ok(registry) => registry,
-            Err(poison) => {
-                let mut registry = poison.into_inner();
-                registry.quarantine();
-                report.selection_failed = true;
-                registry
-            }
-        };
-        registry
-            .entries
-            .values()
-            .filter(|entry| match selection {
-                TargetSelection::All => true,
-                TargetSelection::Focused(fingerprint) => {
-                    fingerprint == Some(entry.tracking.fingerprint)
-                        && registry
-                            .current_by_hwnd
-                            .get(&entry.tracking.fingerprint.hwnd)
-                            == Some(&entry.id)
-                }
-            })
-            .map(|entry| (entry.id, entry.updates.clone()))
-            .collect::<Vec<_>>()
-    };
     report.intended_targets = targets.len();
-    for (_, mailbox) in targets {
-        if mailbox.enqueue(command, update.clone()).is_ok() {
+    drop(registry_guard);
+    for admission in admissions {
+        if admission.is_some_and(|admission| admission.enqueue(command, update.clone()).is_ok()) {
             report.accepted_targets += 1;
         } else {
             report.failed_targets += 1;
@@ -1083,6 +1194,355 @@ mod tests {
             "tacky-borders-ipc-{name}-{}-{id}.sock",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn setter_lock_deadlines_leave_configuration_and_delivery_unchanged() {
+        for blocked_lock in 0..4 {
+            let (gate, config, registry, mailbox) = fixture();
+            let original = config.read().unwrap().global.border_width;
+            let generation = AtomicU64::new(7);
+            let context = CommandContext::new(
+                Instant::now() + Duration::from_millis(40),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let attempt = || {
+                let error = broadcast_update_inner(
+                    &gate,
+                    &config,
+                    Some(&generation),
+                    &registry,
+                    TargetSelection::All,
+                    IpcUpdate::Width(WidthConfig::new(23.0)),
+                    &context,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("deadline"), "{error:#}");
+                assert!(!context.is_committed());
+            };
+            let started = Instant::now();
+            match blocked_lock {
+                0 => {
+                    let _guard = gate.lock().unwrap();
+                    attempt();
+                }
+                1 => {
+                    let _guard = config.read().unwrap();
+                    attempt();
+                }
+                2 => {
+                    let _guard = registry.lock().unwrap();
+                    attempt();
+                }
+                _ => mailbox.while_locked(attempt),
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(config.read().unwrap().global.border_width, original);
+            assert_eq!(gate.lock().unwrap().config_revision, 0);
+            assert_eq!(generation.load(Ordering::Acquire), 7);
+            let MailboxDrain::Updates(pending) = mailbox.try_drain() else {
+                panic!("mailbox unavailable after expired setter");
+            };
+            assert!(pending.width.is_none());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_state_deadline_covers_every_snapshot_lock() {
+        let generation = APP_STATE.config_generation();
+        for blocked_lock in 0..3 {
+            let context = CommandContext::new(
+                Instant::now() + Duration::from_millis(40),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let attempt = || {
+                let result = execute_command(r#"{"cmd":"get_state"}"#, &context);
+                let Err(error) = result else {
+                    panic!("contended state snapshot succeeded");
+                };
+                assert!(error.to_string().contains("deadline"), "{error:#}");
+            };
+            let started = Instant::now();
+            match blocked_lock {
+                0 => {
+                    let _guard = APP_STATE.config.write().unwrap();
+                    attempt();
+                }
+                1 => {
+                    let _guard = APP_STATE.active_window.lock().unwrap();
+                    attempt();
+                }
+                _ => {
+                    let _guard = APP_STATE.border_registry.lock().unwrap();
+                    attempt();
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+        assert_eq!(APP_STATE.config_generation(), generation);
+    }
+
+    #[test]
+    fn poisoned_mailbox_remains_a_partial_delivery_failure() {
+        let (gate, config, registry, mailbox) = fixture();
+        let poisoned = mailbox.clone();
+        assert!(
+            thread::spawn(move || poisoned.while_locked(|| panic!("poison mailbox")))
+                .join()
+                .is_err()
+        );
+        let report = broadcast_update(
+            &gate,
+            &config,
+            &registry,
+            TargetSelection::All,
+            IpcUpdate::Width(WidthConfig::new(23.0)),
+        )
+        .unwrap();
+        assert!(report.config_accepted);
+        assert_eq!(report.failed_targets, 1);
+        assert!(mailbox.control().is_stopped());
+        assert!(mailbox.is_closed());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report.response()).unwrap()["partial"],
+            true
+        );
+    }
+
+    #[test]
+    fn expired_queued_reload_is_rejected_when_owner_eventually_dequeues_it() {
+        let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let context = CommandContext::new(
+            Instant::now() + Duration::from_millis(40),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (host_sender, host_receiver) = std::sync::mpsc::sync_channel(1);
+        host_sender
+            .send(crate::HostAction::ReloadConfig {
+                origin: crate::ReloadOrigin::Ipc,
+                response: Some(_sender),
+                context: Some(context.clone()),
+            })
+            .unwrap();
+        assert!(
+            wait_for_reload(&receiver, &context)
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+        let crate::HostAction::ReloadConfig {
+            origin,
+            context: Some(owner),
+            ..
+        } = host_receiver.recv().unwrap()
+        else {
+            panic!("reload context was not queued");
+        };
+        let completion = Config::reload_with_context(origin, &owner);
+        let ReloadOutcome::Rejected { error, .. } = completion.outcome else {
+            panic!("expired queued reload was accepted");
+        };
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!owner.is_committed());
+        assert!(!completion.retired.retires_ipc_server());
+    }
+
+    #[test]
+    fn reload_wait_returns_committed_outcome_even_after_caller_expiry() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let context = CommandContext::new(
+            Instant::now() + Duration::from_millis(40),
+            Arc::new(AtomicBool::new(false)),
+        );
+        context.begin_commit().unwrap();
+        let owner = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            let (acknowledgement, _received) = std::sync::mpsc::sync_channel(1);
+            sender
+                .send(crate::IpcReloadResponse {
+                    outcome: ReloadOutcome::Applied {
+                        changed: true,
+                        generation: 12,
+                    },
+                    acknowledgement,
+                })
+                .unwrap();
+        });
+        assert!(matches!(
+            wait_for_reload(&receiver, &context).unwrap().outcome,
+            ReloadOutcome::Applied {
+                changed: true,
+                generation: 12
+            }
+        ));
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn reload_wait_distinguishes_owner_disconnection() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(sender);
+        assert!(
+            wait_for_reload(&receiver, &CommandContext::default())
+                .unwrap_err()
+                .to_string()
+                .contains("disconnected")
+        );
+    }
+
+    fn exercise_blocked_worker_pool(cancel: bool) -> anyhow::Result<()> {
+        let path = test_socket_path("command-workers");
+        let listener = UnixListener::bind(&path)?;
+        let queue = Arc::new(ClientQueue::new(IPC_QUEUE_CAPACITY));
+        let active = Arc::new(ActiveClients::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (gate, config, registry, _) = fixture();
+        let original = config.read().unwrap().global.border_width;
+        let held_gate = gate.lock().unwrap();
+        let (entered, entries) = std::sync::mpsc::channel();
+        let (done, completions) = std::sync::mpsc::channel();
+        let limits = IpcLimits {
+            connection_timeout: if cancel {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(250)
+            },
+            ..IpcLimits::default()
+        };
+        let mut workers = Vec::new();
+        for _ in 0..IPC_WORKER_COUNT {
+            let (queue, active, stop) = (queue.clone(), active.clone(), stop.clone());
+            let (gate, config, registry) = (gate.clone(), config.clone(), registry.clone());
+            let (entered, done) = (entered.clone(), done.clone());
+            workers.push(thread::spawn(move || {
+                run_worker_with(queue, active, stop, |stream, stop| {
+                    handle_client_with_processor(stream, limits, stop, |raw, context| {
+                        if matches!(
+                            serde_json::from_str::<IpcCommand>(raw),
+                            Ok(IpcCommand::SetWidth { .. })
+                        ) {
+                            entered.send(()).unwrap();
+                            let result = broadcast_update_inner(
+                                &gate,
+                                &config,
+                                None,
+                                &registry,
+                                TargetSelection::All,
+                                IpcUpdate::Width(WidthConfig::new(23.0)),
+                                context,
+                            );
+                            assert!(result.is_err());
+                            CommandResponse::plain(json!({"ok": false}).to_string())
+                        } else {
+                            process_command(raw, context)
+                        }
+                    })
+                });
+                done.send(()).unwrap();
+            }));
+        }
+        let mut clients = Vec::new();
+        for _ in 0..IPC_WORKER_COUNT {
+            let client = UnixStream::connect(&path)?;
+            let stream = listener.accept()?;
+            assert!(matches!(queue.try_push(stream), PushResult::Queued));
+            (&client).write_all(b"{\"cmd\":\"set_width\",\"width\":23}\n")?;
+            clients.push(client);
+        }
+        for _ in 0..IPC_WORKER_COUNT {
+            entries.recv_timeout(Duration::from_secs(2))?;
+        }
+        assert_eq!(active.state.lock().unwrap().sockets.len(), IPC_WORKER_COUNT);
+        let queued = UnixStream::connect(&path)?;
+        let stream = listener.accept()?;
+        assert!(matches!(queue.try_push(stream), PushResult::Queued));
+        (&queued).write_all(b"{\"cmd\":\"unknown\"}\n")?;
+        if !cancel {
+            queued.set_read_timeout(Duration::from_secs(2))?;
+            let mut response = String::new();
+            BufReader::new(&queued).read_line(&mut response)?;
+            assert!(response.contains("invalid command"));
+        }
+        let shutdown = Instant::now();
+        stop.store(true, Ordering::Release);
+        queue.close_and_drain();
+        active.shutdown_all();
+        for _ in 0..IPC_WORKER_COUNT {
+            completions.recv_timeout(Duration::from_secs(2))?;
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(shutdown.elapsed() < Duration::from_secs(2));
+        assert_eq!(config.read().unwrap().global.border_width, original);
+        assert_eq!(held_gate.config_revision, 0);
+        assert!(active.state.lock().unwrap().sockets.is_empty());
+        drop((clients, queued, listener, held_gate));
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn command_deadlines_release_all_four_workers_and_service_queued_client() -> anyhow::Result<()>
+    {
+        exercise_blocked_worker_pool(false)
+    }
+
+    #[test]
+    fn shutdown_joins_all_four_command_workers_while_application_gate_is_still_locked()
+    -> anyhow::Result<()> {
+        exercise_blocked_worker_pool(true)
+    }
+
+    #[test]
+    fn cli_deadline_is_absolute_even_with_response_trickle() -> anyhow::Result<()> {
+        let path = test_socket_path("cli-trickle");
+        let listener = UnixListener::bind(&path)?;
+        let peer = thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            while (&stream).write_all(b" ").is_ok() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        let result = send_command_to(&path, r#"{"cmd":"get_state"}"#, Duration::from_millis(100));
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        peer.join().unwrap();
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_accepts_normal_reply_and_reports_empty_eof_separately() -> anyhow::Result<()> {
+        for reply in [Some("{\"ok\":true}\n"), None] {
+            let path = test_socket_path("cli-reply");
+            let listener = UnixListener::bind(&path)?;
+            let peer = thread::spawn(move || {
+                let stream = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                if let Some(reply) = reply {
+                    (&stream).write_all(reply.as_bytes()).unwrap();
+                }
+            });
+            let result = send_command_to(&path, r#"{"cmd":"get_state"}"#, Duration::from_secs(2));
+            match reply {
+                Some(_) => assert_eq!(result?, "{\"ok\":true}"),
+                None => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("closed without a response")
+                ),
+            }
+            peer.join().unwrap();
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -1316,7 +1776,7 @@ mod tests {
             ..IpcLimits::default()
         };
         let handler = thread::spawn(move || {
-            handle_client_with_limits(&server_stream, limits, &AtomicBool::new(false))
+            handle_client_with_limits(&server_stream, limits, &Arc::new(AtomicBool::new(false)))
         });
         let started = Instant::now();
 
@@ -1452,7 +1912,7 @@ mod tests {
             ..IpcLimits::default()
         };
         let handler = thread::spawn(move || {
-            handle_client_with_limits(&server_stream, limits, &AtomicBool::new(false))
+            handle_client_with_limits(&server_stream, limits, &Arc::new(AtomicBool::new(false)))
         });
 
         for _ in 0..3 {
@@ -1485,7 +1945,7 @@ mod tests {
             ..IpcLimits::default()
         };
         let handler = thread::spawn(move || {
-            handle_client_with_limits(&server_stream, limits, &AtomicBool::new(false))
+            handle_client_with_limits(&server_stream, limits, &Arc::new(AtomicBool::new(false)))
         });
 
         for _ in 0..3 {
@@ -1730,11 +2190,14 @@ mod tests {
                 .unwrap()
             }));
             let deadline = Instant::now() + Duration::from_secs(2);
-            while config.read().unwrap().global.border_width != WidthConfig::new(9.0) {
+            while gate.try_lock().is_ok() {
                 assert!(Instant::now() < deadline);
                 thread::yield_now();
             }
-            assert!(gate.try_lock().is_err());
+            while config.try_read().is_ok() {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
             let second_gate = gate.clone();
             let second_config = config.clone();
             let second_registry = registry.clone();

@@ -12,6 +12,7 @@ pub mod border_registry;
 pub mod border_runtime;
 pub mod border_updates;
 pub mod colors;
+pub mod command_context;
 pub mod config;
 pub mod effects;
 pub mod event_hook;
@@ -107,6 +108,7 @@ pub enum ReloadOrigin {
     Ipc,
 }
 
+#[derive(Debug)]
 pub struct IpcReloadResponse {
     pub outcome: config::ReloadOutcome,
     pub acknowledgement: std::sync::mpsc::SyncSender<()>,
@@ -117,6 +119,7 @@ pub enum HostAction {
     ReloadConfig {
         origin: ReloadOrigin,
         response: Option<std::sync::mpsc::SyncSender<IpcReloadResponse>>,
+        context: Option<command_context::CommandContext>,
     },
     ReloadBorders,
 }
@@ -152,16 +155,19 @@ pub fn submit_host_action(action: HostAction) -> anyhow::Result<()> {
 
 pub fn submit_ipc_reload(
     response: std::sync::mpsc::SyncSender<IpcReloadResponse>,
+    context: &command_context::CommandContext,
 ) -> anyhow::Result<()> {
-    let accepting = IPC_RELOAD_SUBMISSIONS
-        .get()
-        .ok_or_else(|| anyhow!("ipc reload gate not initialized"))?
-        .lock()
-        .map_err(|_| anyhow!("ipc reload gate poisoned"))?;
+    let accepting = context.lock(
+        IPC_RELOAD_SUBMISSIONS
+            .get()
+            .ok_or_else(|| anyhow!("ipc reload gate not initialized"))?,
+        "ipc reload gate",
+    )?;
     anyhow::ensure!(*accepting, "ipc server is being retired");
     submit_host_action(HostAction::ReloadConfig {
         origin: ReloadOrigin::Ipc,
         response: Some(response),
+        context: Some(context.clone()),
     })
 }
 
@@ -264,11 +270,12 @@ impl AppState {
             .ok_or_else(|| anyhow!("lifecycle coordinator not started"))
     }
 
-    pub(crate) fn border_windows(&self) -> Vec<(isize, isize)> {
-        let Some(registry) = border_coordinator::try_registry(&self.border_registry) else {
-            return Vec::new();
-        };
-        registry
+    pub(crate) fn border_windows(
+        &self,
+        context: &command_context::CommandContext,
+    ) -> anyhow::Result<Vec<(isize, isize)>> {
+        let registry = context.lock(&self.border_registry, "border registry")?;
+        Ok(registry
             .entries
             .values()
             .filter(|entry| {
@@ -279,7 +286,7 @@ impl AppState {
                     .border_hwnd
                     .map(|hwnd| (entry.tracking.fingerprint.hwnd, hwnd))
             })
-            .collect()
+            .collect())
     }
 
     pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, RuntimeConfig> {
@@ -469,30 +476,44 @@ impl BackgroundServices {
     pub(crate) fn prepare_reload(
         presence: ServicePresence,
         config: &Config,
+        context: &command_context::CommandContext,
     ) -> anyhow::Result<BackgroundServicePlan> {
+        context.check()?;
         Ok(BackgroundServicePlan {
             config_watcher: Self::prepare_service(
                 presence.config_watcher,
                 config.is_config_watcher_enabled(),
-                create_config_watcher,
+                || {
+                    context.check()?;
+                    create_config_watcher()
+                },
             )
             .map_err(|error| error.context("prepare config watcher"))?,
             komorebi_integration: Self::prepare_service(
                 presence.komorebi_integration,
                 config.is_komorebi_integration_enabled(),
-                KomorebiIntegration::new,
+                || {
+                    context.check()?;
+                    KomorebiIntegration::new()
+                },
             )
             .map_err(|error| error.context("prepare komorebi integration"))?,
             theme_watcher: Self::prepare_service(
                 presence.theme_watcher,
                 config.is_theme_aware_enabled(),
-                ThemeWatcher::new,
+                || {
+                    context.check()?;
+                    ThemeWatcher::new()
+                },
             )
             .map_err(|error| error.context("prepare theme watcher"))?,
             ipc_server: Self::prepare_service(
                 presence.ipc_server,
                 config.is_ipc_server_enabled(),
-                || ipc::socket_path().and_then(|path| IpcServer::new(&path)),
+                || {
+                    context.check()?;
+                    ipc::socket_path().and_then(|path| IpcServer::new(&path))
+                },
             )
             .map_err(|error| error.context("prepare ipc server"))?,
         })

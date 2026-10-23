@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::border_registry::{BorderControl, BorderEvent};
 use crate::colors::ColorBrushConfig;
@@ -177,6 +177,24 @@ pub struct BorderUpdateMailbox {
     control: Arc<BorderControl>,
 }
 
+pub(crate) struct MailboxAdmission<'a> {
+    mailbox: &'a BorderUpdateMailbox,
+    state: MutexGuard<'a, MailboxState>,
+}
+
+impl MailboxAdmission<'_> {
+    pub(crate) fn enqueue(
+        self,
+        command_id: AppearanceCommandId,
+        update: IpcUpdate,
+    ) -> Result<(), EnqueueError> {
+        self.mailbox
+            .enqueue_locked(self.state, command_id, update, || {
+                self.mailbox.wake_event.signal()
+            })
+    }
+}
+
 #[derive(Debug)]
 pub enum EnqueueError {
     Closed,
@@ -244,13 +262,38 @@ impl BorderUpdateMailbox {
         self.enqueue_with(command_id, update, || self.wake_event.signal())
     }
 
+    pub(crate) fn admit(
+        &self,
+        context: &crate::command_context::CommandContext,
+    ) -> anyhow::Result<Option<MailboxAdmission<'_>>> {
+        loop {
+            context.check()?;
+            match self.state.try_lock() {
+                Ok(state) => {
+                    return Ok(Some(MailboxAdmission {
+                        mailbox: self,
+                        state,
+                    }));
+                }
+                Err(TryLockError::WouldBlock) => context.pause()?,
+                Err(TryLockError::Poisoned(poison)) => {
+                    let reclaimed = self.reclaim(poison.into_inner());
+                    self.control.record_stop();
+                    let _ = self.control.signal_stop();
+                    drop(reclaimed);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     fn enqueue_with(
         &self,
         command_id: AppearanceCommandId,
         update: IpcUpdate,
         signal: impl FnOnce() -> windows::core::Result<()>,
     ) -> Result<(), EnqueueError> {
-        let mut state = match self.state.lock() {
+        let state = match self.state.lock() {
             Ok(state) => state,
             Err(poison) => {
                 let reclaimed = self.reclaim(poison.into_inner());
@@ -260,6 +303,16 @@ impl BorderUpdateMailbox {
                 return Err(EnqueueError::Poisoned);
             }
         };
+        self.enqueue_locked(state, command_id, update, signal)
+    }
+
+    fn enqueue_locked(
+        &self,
+        mut state: MutexGuard<'_, MailboxState>,
+        command_id: AppearanceCommandId,
+        update: IpcUpdate,
+        signal: impl FnOnce() -> windows::core::Result<()>,
+    ) -> Result<(), EnqueueError> {
         if !state.accepting || self.control.is_stopped() {
             return Err(EnqueueError::Closed);
         }

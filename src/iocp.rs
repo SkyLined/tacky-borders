@@ -7,11 +7,11 @@ use std::time;
 use std::{io, mem, ptr};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Networking::WinSock::{
-    ADDRESS_FAMILY, AF_UNIX, AcceptEx, FIONBIO, INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS,
-    SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET,
-    SOMAXCONN, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF, WSAGetLastError, WSARecv, WSASend,
-    WSASocketW, accept, bind, closesocket, connect, ioctlsocket, listen, recv, send, setsockopt,
-    shutdown,
+    ADDRESS_FAMILY, AF_UNIX, AcceptEx, FIONBIO, INVALID_SOCKET, POLLWRNORM, SD_BOTH,
+    SEND_RECV_FLAGS, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN,
+    SOCKET, SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF,
+    WSAEWOULDBLOCK, WSAGetLastError, WSAPOLLFD, WSAPoll, WSARecv, WSASend, WSASocketW, accept,
+    bind, closesocket, connect, getsockopt, ioctlsocket, listen, recv, send, setsockopt, shutdown,
 };
 use windows::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, GetQueuedCompletionStatusEx,
@@ -190,6 +190,70 @@ pub struct UnixStream {
 unsafe impl Send for UnixStream {}
 
 impl UnixStream {
+    pub(crate) fn connect_timeout(path: &Path, timeout: time::Duration) -> io::Result<Self> {
+        winsock::init();
+        let socket = UnixDomainSocket::new()?;
+        socket.set_nonblocking(true)?;
+        let deadline = time::Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "connect deadline overflow")
+        })?;
+        if let Err(error) = socket.connect(path) {
+            if error.raw_os_error() != Some(WSAEWOULDBLOCK.0) {
+                return Err(error);
+            }
+            let remaining = deadline.saturating_duration_since(time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC connect timed out",
+                ));
+            }
+            let mut poll = [WSAPOLLFD {
+                fd: socket.0,
+                events: POLLWRNORM,
+                revents: Default::default(),
+            }];
+            let millis = timeout_millis(remaining)?.min(i32::MAX as u32) as i32;
+            let ready = unsafe { WSAPoll(poll.as_mut_ptr(), 1, millis) };
+            if ready == SOCKET_ERROR {
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError().0 }));
+            }
+            if ready == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC connect timed out",
+                ));
+            }
+            let mut error = [0u8; 4];
+            let mut length = 4;
+            if unsafe {
+                getsockopt(
+                    socket.0,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    PSTR(error.as_mut_ptr()),
+                    &mut length,
+                )
+            } == SOCKET_ERROR
+            {
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError().0 }));
+            }
+            let code = i32::from_ne_bytes(error);
+            if code != 0 {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+        }
+        socket.set_nonblocking(false)?;
+        Ok(Self {
+            socket,
+            overlapped_context: OverlappedContext {
+                overlapped: Box::new(OVERLAPPED::default()),
+                buffer: None,
+                flags: Box::new(0),
+            },
+        })
+    }
+
     pub fn connect(path: &Path) -> io::Result<Self> {
         winsock::init();
 

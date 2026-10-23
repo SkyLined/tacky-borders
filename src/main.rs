@@ -10,7 +10,7 @@ extern crate sp_log;
 use anyhow::{Context, anyhow};
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use tacky_borders::border_coordinator::{
@@ -18,7 +18,6 @@ use tacky_borders::border_coordinator::{
 };
 use tacky_borders::colors::ColorBrushConfig;
 use tacky_borders::config::{OffsetConfig, RadiusConfig, WidthConfig};
-use tacky_borders::iocp::UnixStream;
 use tacky_borders::ipc::{IpcCommand, socket_path};
 use tacky_borders::sys_tray_icon::create_tray_icon;
 use tacky_borders::utils::{LogIfErr, imm_disable_ime, set_process_dpi_awareness_context};
@@ -259,6 +258,7 @@ fn reject_queued_ipc_reloads(
             HostAction::ReloadConfig {
                 origin: ReloadOrigin::Ipc,
                 response: Some(response),
+                ..
             } => {
                 let request = ConfigReloadRequest {
                     origin: ReloadOrigin::Ipc,
@@ -340,24 +340,35 @@ fn run_host_loop(
                         break;
                     }
                     let submitted = match action {
-                        HostAction::ReloadConfig { origin, response } => {
+                        HostAction::ReloadConfig {
+                            origin,
+                            response,
+                            context,
+                        } => {
                             let request = ConfigReloadRequest { origin, response };
-                            let completion = tacky_borders::config::Config::reload(origin);
+                            let completion = match &context {
+                                Some(context) => {
+                                    tacky_borders::config::Config::reload_with_context(
+                                        origin, context,
+                                    )
+                                }
+                                None => tacky_borders::config::Config::reload(origin),
+                            };
                             let reload_changed = matches!(
                                 &completion.outcome,
                                 tacky_borders::config::ReloadOutcome::Applied { changed: true, .. }
                             );
                             let retiring_ipc = completion.retired.retires_ipc_server();
+                            if let Some(acknowledgement) =
+                                deliver_reload_outcome(&request, completion.outcome)
+                            {
+                                let _ = acknowledgement.recv();
+                            }
                             if retiring_ipc {
                                 tacky_borders::set_ipc_reload_submissions(false)
                                     .context("close ipc reload admission")
                                     .log_if_err();
                                 reject_queued_ipc_reloads(&requests.receiver, &mut pending_actions);
-                            }
-                            if let Some(acknowledgement) =
-                                deliver_reload_outcome(&request, completion.outcome)
-                            {
-                                let _ = acknowledgement.recv();
                             }
                             let ipc_is_active = BG_SERVICES
                                 .lock()
@@ -600,26 +611,11 @@ fn validate_response(response: &str) -> anyhow::Result<()> {
 
 fn send_command(command_json: &str) -> anyhow::Result<String> {
     let socket_path = socket_path().context("could not get socket path")?;
-
-    let stream = UnixStream::connect(&socket_path).with_context(|| {
-        format!(
-            "could not connect to {}; is tacky-borders running with the ipc server enabled?",
-            socket_path.display()
-        )
-    })?;
-
-    let message = format!("{command_json}\n");
-    (&stream)
-        .write_all(message.as_bytes())
-        .context("could not send command")?;
-
-    let mut reader = BufReader::new(&stream);
-    let mut response = String::new();
-    reader
-        .read_line(&mut response)
-        .context("could not read response")?;
-
-    Ok(response)
+    tacky_borders::ipc::send_command_to(
+        &socket_path,
+        command_json,
+        tacky_borders::ipc::CLI_COMMAND_TIMEOUT,
+    )
 }
 
 fn parse_color_arg(s: &str) -> anyhow::Result<ColorBrushConfig> {

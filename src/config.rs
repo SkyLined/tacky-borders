@@ -464,16 +464,24 @@ impl Config {
     }
 
     fn read_contents() -> anyhow::Result<String> {
+        Self::read_contents_with_context(&crate::command_context::CommandContext::default())
+    }
+
+    fn read_contents_with_context(
+        context: &crate::command_context::CommandContext,
+    ) -> anyhow::Result<String> {
+        context.check()?;
         let config_dir = Self::get_dir()?;
         let config_path = config_dir.join("config.yaml");
 
         // When saving files with a text editor like VSCode or Neovim, there may be a small time
         // period where the target file is empty or doesn't exist, so we'll use some retries.
+        context.check()?;
         let mut exists = fs::exists(&config_path).context("could not check if config exists")?;
         for _ in 0..2 {
             if !exists {
                 debug!("config does not exist; attempting to check again");
-                thread::sleep(time::Duration::from_millis(20));
+                context.wait(time::Duration::from_millis(20))?;
                 exists = fs::exists(&config_path).context("could not check if config exists")?;
             } else {
                 break;
@@ -482,6 +490,7 @@ impl Config {
 
         // If the config.yaml does not exist, try to create it
         if !exists {
+            context.check()?;
             let default_contents = DEFAULT_CONFIG.as_bytes();
             fs::write(&config_path, default_contents)
                 .context("could not create default config.yaml")?;
@@ -490,11 +499,12 @@ impl Config {
         }
 
         // We also implement retries here for the same reasons listed earlier
+        context.check()?;
         let mut contents = fs::read_to_string(&config_path).context("could not read config")?;
         for _ in 0..2 {
             if contents.is_empty() {
                 debug!("config is empty; attempting to read again");
-                thread::sleep(time::Duration::from_millis(20));
+                context.wait(time::Duration::from_millis(20))?;
                 contents = fs::read_to_string(&config_path).context("could not read config")?;
             } else {
                 break;
@@ -524,7 +534,17 @@ impl Config {
     }
 
     pub fn reload(origin: crate::ReloadOrigin) -> ReloadCompletion {
-        let contents = match Self::read_contents() {
+        Self::reload_with_context(origin, &crate::command_context::CommandContext::default())
+    }
+
+    pub fn reload_with_context(
+        origin: crate::ReloadOrigin,
+        context: &crate::command_context::CommandContext,
+    ) -> ReloadCompletion {
+        if let Err(error) = context.check() {
+            return reject_reload(ReloadStage::Commit, error, origin, 0);
+        }
+        let contents = match Self::read_contents_with_context(context) {
             Ok(contents) => contents,
             Err(error) => {
                 return reject_reload(
@@ -535,6 +555,9 @@ impl Config {
                 );
             }
         };
+        if let Err(error) = context.check() {
+            return reject_reload(ReloadStage::Parse, error, origin, 0);
+        }
         let source = match serde_yaml_ng::from_str::<Config>(&contents) {
             Ok(source) => source,
             Err(error) => {
@@ -546,6 +569,9 @@ impl Config {
                 );
             }
         };
+        if let Err(error) = context.check() {
+            return reject_reload(ReloadStage::Validate, error, origin, 0);
+        }
         let candidate = match RuntimeConfig::from_source(source) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -559,19 +585,13 @@ impl Config {
         };
         for attempt in 0..=1 {
             let snapshot = (|| -> anyhow::Result<_> {
-                let active = APP_STATE
-                    .config
-                    .read()
-                    .map_err(|_| anyhow!("configuration poisoned"))?;
+                let active = context.read(&APP_STATE.config, "configuration")?;
                 let generation = APP_STATE.config_generation();
-                let services = BG_SERVICES
-                    .lock()
-                    .map_err(|_| anyhow!("background services poisoned"))?
+                let services = context
+                    .lock(&BG_SERVICES, "background services")?
                     .presence();
-                let directx_present = APP_STATE
-                    .directx_devices
-                    .read()
-                    .map_err(|_| anyhow!("render device state poisoned"))?
+                let directx_present = context
+                    .read(&APP_STATE.directx_devices, "render device state")?
                     .is_some();
                 Ok((active.clone(), generation, services, directx_present))
             })();
@@ -595,7 +615,16 @@ impl Config {
             let services_satisfied =
                 crate::BackgroundServices::services_satisfy(service_presence, candidate.source());
             if active == candidate && services_satisfied && directx_present == renderer_needed {
-                clear_watcher_rejection();
+                let accepted = (|| -> anyhow::Result<()> {
+                    let mut rejection =
+                        context.lock(&LAST_WATCHER_REJECTION, "watcher rejection state")?;
+                    context.begin_commit()?;
+                    *rejection = None;
+                    Ok(())
+                })();
+                if let Err(error) = accepted {
+                    return reject_reload(ReloadStage::Commit, error, origin, 0);
+                }
                 return ReloadCompletion {
                     outcome: ReloadOutcome::Applied {
                         changed: false,
@@ -611,6 +640,7 @@ impl Config {
             let service_plan = match crate::BackgroundServices::prepare_reload(
                 service_presence,
                 candidate.source(),
+                context,
             ) {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -628,6 +658,7 @@ impl Config {
             };
             let renderer_plan =
                 match prepare_renderer_plan(renderer_needed, directx_present, || {
+                    context.check()?;
                     DirectXDevices::new(&APP_STATE.render_factory).map_err(anyhow::Error::from)
                 }) {
                     Ok(plan) => plan,
@@ -663,21 +694,11 @@ impl Config {
 
             let commit = (|| -> Result<_, ReloadCommitError> {
                 // Appearance mutations acquire these locks in the same order.
-                let mut sequence = APP_STATE
-                    .appearance
-                    .lock()
-                    .map_err(|_| anyhow!("appearance gate poisoned"))?;
-                let mut config = APP_STATE
-                    .config
-                    .write()
-                    .map_err(|_| anyhow!("configuration poisoned"))?;
-                let mut services = BG_SERVICES
-                    .lock()
-                    .map_err(|_| anyhow!("background services poisoned"))?;
-                let mut devices = APP_STATE
-                    .directx_devices
-                    .write()
-                    .map_err(|_| anyhow!("render device state poisoned"))?;
+                let mut sequence = context.lock(&APP_STATE.appearance, "appearance gate")?;
+                let mut config = context.write(&APP_STATE.config, "configuration")?;
+                let mut services = context.lock(&BG_SERVICES, "background services")?;
+                let mut devices =
+                    context.write(&APP_STATE.directx_devices, "render device state")?;
 
                 if APP_STATE.config_generation() != base_generation
                     || *config != active
@@ -695,6 +716,9 @@ impl Config {
                     .config_revision
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("configuration revisions exhausted"))?;
+                let mut rejection =
+                    context.lock(&LAST_WATCHER_REJECTION, "watcher rejection state")?;
+                context.begin_commit()?;
                 let command = sequence
                     .next_command()
                     .ok_or_else(|| anyhow!("appearance commands exhausted"))?;
@@ -715,6 +739,7 @@ impl Config {
                     radius: command,
                 };
                 APP_STATE.publish_config_generation(next_generation);
+                *rejection = None;
                 drop(devices);
                 drop(services);
                 drop(config);
@@ -727,7 +752,6 @@ impl Config {
 
             match commit {
                 Ok(retired) => {
-                    clear_watcher_rejection();
                     return ReloadCompletion {
                         outcome: ReloadOutcome::Applied {
                             changed: true,
@@ -845,12 +869,6 @@ fn rejection_fingerprint(contents: &str, stage: ReloadStage, description: &str) 
     stage.hash(&mut hasher);
     description.hash(&mut hasher);
     hasher.finish()
-}
-
-fn clear_watcher_rejection() {
-    *LAST_WATCHER_REJECTION
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
 fn reject_reload(
@@ -1164,6 +1182,7 @@ fn request_config_reload() -> anyhow::Result<()> {
         crate::submit_host_action(crate::HostAction::ReloadConfig {
             origin: crate::ReloadOrigin::Watcher,
             response: None,
+            context: None,
         })
     })
 }
@@ -1242,6 +1261,7 @@ fn submit_config_reload_action() -> anyhow::Result<()> {
     crate::submit_host_action(crate::HostAction::ReloadConfig {
         origin: crate::ReloadOrigin::Watcher,
         response: None,
+        context: None,
     })
 }
 
