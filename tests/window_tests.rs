@@ -116,17 +116,42 @@ impl Cohort {
         ))))
     }
 
-    fn pump_until(&mut self, mut ready: impl FnMut(&mut BorderCoordinator) -> bool) {
+    fn pump_until(&mut self, stage: &str, mut ready: impl FnMut(&mut BorderCoordinator) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             self.0.service_turn();
             if ready(&mut self.0) {
                 return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "test-owned cohort failed to complete"
-            );
+            if Instant::now() >= deadline {
+                let registry = self.0.registry.lock().unwrap();
+                let entries = registry
+                    .entries
+                    .values()
+                    .map(|entry| {
+                        (
+                            entry.id,
+                            entry.phase,
+                            entry.border_hwnd,
+                            entry.worker_thread_id,
+                            entry.launch_pending,
+                            entry.control.is_stopped(),
+                            entry.updates.is_closed(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                drop(registry);
+                let outcomes = std::iter::from_fn(|| self.0.take_outcome()).collect::<Vec<_>>();
+                panic!(
+                    "test-owned cohort failed at {stage}; awaiting_baseline={:?}; \
+                     settled={}; entries={entries:?}; outcomes={outcomes:?}; \
+                     dropped_outcomes={}; signal_failures={}",
+                    self.0.awaiting_baseline(),
+                    self.0.is_settled(),
+                    self.0.dropped_outcomes,
+                    self.0.signal_failures,
+                );
+            }
             thread::yield_now();
         }
     }
@@ -143,7 +168,9 @@ impl Cohort {
                 Instant::now() + Duration::from_secs(10),
             )
             .unwrap();
-        self.pump_until(|coordinator| coordinator.awaiting_baseline() == Some(operation));
+        self.pump_until("reload awaiting baseline", |coordinator| {
+            coordinator.awaiting_baseline() == Some(operation)
+        });
         let windows = tracking
             .iter()
             .map(|tracking| {
@@ -174,7 +201,7 @@ impl Cohort {
             }
             other => panic!("unexpected reload outcome: {other:?}"),
         };
-        self.pump_until(|coordinator| {
+        self.pump_until("reload waiting for workers to run", |coordinator| {
             let registry = coordinator.registry.lock().unwrap();
             ids.iter().all(|id| {
                 registry
@@ -199,7 +226,7 @@ impl Cohort {
             .begin_operation(kind, Instant::now() + Duration::from_secs(10))
             .unwrap();
         let mut outcome = None;
-        self.pump_until(|coordinator| {
+        self.pump_until("stop waiting for operation outcome", |coordinator| {
             outcome = coordinator.take_operation_outcome();
             outcome.is_some()
         });
@@ -829,7 +856,7 @@ fn sustained_animated_lifecycle_resources_are_bounded() -> anyhow::Result<()> {
 #[ignore = "invoked only by the externally bounded resource owner"]
 fn animated_resource_stress_helper() -> anyhow::Result<()> {
     use tacky_borders::border_registry::{BorderWorkerResult, DesiredVisibility};
-    use tacky_borders::{APP_STATE, animations::AnimationsConfig};
+    use tacky_borders::{APP_STATE, animations::AnimationsConfig, config::ZOrderMode};
     use windows::Win32::UI::WindowsAndMessaging::{
         IsWindowVisible, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
         SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
@@ -843,6 +870,7 @@ fn animated_resource_stress_helper() -> anyhow::Result<()> {
     APP_STATE.update_config(|config| {
         config.global.follow_native_border = false;
         config.global.animations = animations;
+        config.global.border_z_order = ZOrderMode::BelowWindow;
     })?;
     fn phase(phase: &str) -> anyhow::Result<()> {
         use std::io::Write;
@@ -871,7 +899,9 @@ fn animated_resource_stress_helper() -> anyhow::Result<()> {
             )?;
         }
         let mut cohort = Cohort::new();
-        cohort.pump_until(|_| unsafe { IsWindowVisible(tracking_hwnd) }.as_bool());
+        cohort.pump_until("tracking window to become visible", |_| {
+            unsafe { IsWindowVisible(tracking_hwnd) }.as_bool()
+        });
         let (id, hwnd) = cohort.reload(&tracking);
         let border = HWND(hwnd as _);
         let control = cohort.0.registry.lock().unwrap().entries[&id]
@@ -881,12 +911,16 @@ fn animated_resource_stress_helper() -> anyhow::Result<()> {
             let _ = ShowWindow(tracking_hwnd, SW_SHOWMINNOACTIVE);
         }
         control.set_visibility(DesiredVisibility::Hidden);
-        cohort.pump_until(|_| !unsafe { IsWindowVisible(border) }.as_bool());
+        cohort.pump_until("border to hide", |_| {
+            !unsafe { IsWindowVisible(border) }.as_bool()
+        });
         unsafe {
             let _ = ShowWindow(tracking_hwnd, SW_SHOWNOACTIVATE);
         }
         control.set_visibility(DesiredVisibility::Visible);
-        cohort.pump_until(|_| unsafe { IsWindowVisible(border) }.as_bool());
+        cohort.pump_until("border to become visible", |_| {
+            unsafe { IsWindowVisible(border) }.as_bool()
+        });
         let frames_until = Instant::now() + Duration::from_millis(200);
         while Instant::now() < frames_until {
             cohort.0.service_turn();
@@ -897,7 +931,9 @@ fn animated_resource_stress_helper() -> anyhow::Result<()> {
         phase(if warm { "warm_active" } else { "active" })?;
         if fault {
             control.record_callback_failure();
-            cohort.pump_until(|coordinator| coordinator.is_settled());
+            cohort.pump_until("faulted worker to settle", |coordinator| {
+                coordinator.is_settled()
+            });
         } else {
             cohort.stop(OperationKind::Shutdown);
         }

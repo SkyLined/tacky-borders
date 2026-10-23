@@ -457,7 +457,7 @@ pub struct BorderWorkerContext {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum WorkerStage {
     SnapshotDeferred,
     Created(isize),
@@ -467,7 +467,7 @@ pub enum WorkerStage {
     Running(isize),
     SecondRenderDue,
     IdleWait,
-    BodyExited,
+    BodyExited(crate::border_registry::BorderWorkerResult),
 }
 
 impl BorderWorkerContext {
@@ -569,7 +569,7 @@ pub fn run_border_worker(context: BorderWorkerContext) -> BorderWorkerExit {
     let primary = match catch_unwind(AssertUnwindSafe(|| {
         let mut primary = run_worker_body(&context);
         #[cfg(test)]
-        context.report_stage(WorkerStage::BodyExited);
+        context.report_stage(WorkerStage::BodyExited(primary.clone()));
         if primary == BorderWorkerResult::Completed {
             if callback_failed() || context.control.callback_failed() {
                 primary = BorderWorkerResult::CallbackFailed;
@@ -1085,6 +1085,7 @@ mod tests {
         HWND,
         std::sync::mpsc::Sender<()>,
         Option<std::thread::JoinHandle<()>>,
+        crate::config::ZOrderMode,
     );
 
     impl Drop for TrackingFixture {
@@ -1095,6 +1096,7 @@ mod tests {
             {
                 discard_panic(payload);
             }
+            crate::APP_STATE.get_config_mut().global.border_z_order = self.3;
         }
     }
 
@@ -1142,11 +1144,15 @@ mod tests {
                 }
             }
         });
-        TrackingFixture(
-            HWND(ready.recv_timeout(Duration::from_secs(2)).unwrap() as _),
-            stop,
-            Some(worker),
-        )
+        let hwnd = HWND(ready.recv_timeout(Duration::from_secs(2)).unwrap() as _);
+        let previous_z_order = {
+            let mut config = crate::APP_STATE.get_config_mut();
+            std::mem::replace(
+                &mut config.global.border_z_order,
+                crate::config::ZOrderMode::BelowWindow,
+            )
+        };
+        TrackingFixture(hwnd, stop, Some(worker), previous_z_order)
     }
 
     fn worker_context(hwnd: HWND) -> BorderWorkerContext {
@@ -1432,7 +1438,7 @@ mod tests {
                 sender.send(hwnd).unwrap();
                 control.record_stop();
             }
-            WorkerStage::BodyExited => {
+            WorkerStage::BodyExited(_) => {
                 if callback {
                     control.record_callback_failure();
                 } else {
@@ -1563,7 +1569,7 @@ mod tests {
         let control = context.control.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(16);
         context.probe = Some(Arc::new(move |stage| {
-            let _ = sender.try_send(stage);
+            let _ = sender.try_send(stage.clone());
         }));
         let gate = crate::APP_STATE.appearance.lock().unwrap();
         let worker = TestWorker::spawn(context);
@@ -1776,7 +1782,7 @@ mod tests {
             if matches!(stage, WorkerStage::Created(_)) {
                 return;
             }
-            let _ = sender.try_send(stage);
+            let _ = sender.try_send(stage.clone());
             if matches!(stage, WorkerStage::Prepared(_)) {
                 while !probe_control.is_stopped() {
                     match paused
@@ -1868,7 +1874,7 @@ mod tests {
                 });
             }
             if !matches!(stage, WorkerStage::Created(_)) {
-                let _ = stage_sender.send(stage);
+                let _ = stage_sender.send(stage.clone());
             }
             if matches!(stage, WorkerStage::Prepared(_))
                 && !prepared_barrier_used.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -2390,7 +2396,7 @@ mod tests {
         let paused = Mutex::new(paused);
         let wait_barrier_used = std::sync::atomic::AtomicBool::new(false);
         context.probe = Some(Arc::new(move |stage| {
-            let _ = stage_sender.send(stage);
+            let _ = stage_sender.send(stage.clone());
             if matches!(stage, WorkerStage::IdleWait)
                 && !wait_barrier_used.swap(true, std::sync::atomic::Ordering::AcqRel)
             {

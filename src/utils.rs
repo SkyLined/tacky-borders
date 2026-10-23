@@ -1241,6 +1241,8 @@ mod tests {
             let previous_registry =
                 std::mem::replace(&mut *APP_STATE.border_registry.lock().unwrap(), registry);
             let previous_config = std::mem::take(&mut *APP_STATE.get_config_mut());
+            APP_STATE.get_config_mut().global.border_z_order =
+                crate::config::ZOrderMode::BelowWindow;
             Ok(Self {
                 previous_registry,
                 previous_config,
@@ -1757,13 +1759,19 @@ mod tests {
             *APP_STATE.get_directx_devices_mut() =
                 Some(crate::DirectXDevices::new(APP_STATE.get_render_factory())?);
         }
-        APP_STATE.get_config_mut().global.follow_native_border = false;
+        {
+            let mut config = APP_STATE.get_config_mut();
+            config.global.follow_native_border = false;
+        }
         let destroyed = Arc::new(AtomicBool::new(false));
         let failed_control = fixture.control.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
+        let observed_stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stage_log = observed_stages.clone();
         let host = crate::border_coordinator::BorderLifecycleCoordinator::start_with_worker_probe(
             APP_STATE.border_registry.clone(),
             Arc::new(move |stage| {
+                stage_log.lock().unwrap().push(stage.clone());
                 if let crate::border_runtime::WorkerStage::Running(hwnd) = stage
                     && !destroyed.swap(true, Ordering::AcqRel)
                 {
@@ -1793,7 +1801,14 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        let old_hwnd = receiver.recv_timeout(time::Duration::from_secs(2))?;
+        let old_hwnd = receiver
+            .recv_timeout(time::Duration::from_secs(2))
+            .map_err(|error| {
+                anyhow!(
+                    "{error}; observed worker stages: {:?}",
+                    *observed_stages.lock().unwrap()
+                )
+            })?;
         assert!(!is_window(Some(HWND(old_hwnd as _))));
         let old_id = fixture.instance;
         assert!(fixture.control.is_stopped());
