@@ -6,6 +6,7 @@ use crate::render_backend::RenderBackendConfig;
 use crate::utils::{OwnedHANDLE, get_adjusted_radius, get_window_corner_preference};
 use crate::{APP_STATE, BG_SERVICES, DirectXDevices, IS_WINDOWS_11};
 use anyhow::{Context, anyhow};
+#[cfg(not(test))]
 use dirs::home_dir;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,23 @@ const CONFIG_RELOAD_PENDING: u8 = 1;
 const CONFIG_RELOAD_DIRTY: u8 = 2;
 static CONFIG_RELOAD_STATE: AtomicU8 = AtomicU8::new(CONFIG_RELOAD_IDLE);
 static LAST_WATCHER_REJECTION: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn unit_test_config_dir() -> PathBuf {
+    static CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CONFIG_DIR
+        .get_or_init(|| {
+            let nonce = time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .expect("system clock is after UNIX epoch")
+                .as_nanos();
+            env::temp_dir().join(format!(
+                "tacky-borders-unit-tests-{}-{nonce}",
+                std::process::id()
+            ))
+        })
+        .clone()
+}
 
 /// The config.yaml definition
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -515,6 +533,9 @@ impl Config {
     }
 
     pub fn get_dir() -> anyhow::Result<PathBuf> {
+        #[cfg(test)]
+        let config_dir = unit_test_config_dir();
+        #[cfg(not(test))]
         let config_dir = env::var("TACKY_BORDERS_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|env_err| {
@@ -1268,6 +1289,17 @@ fn submit_config_reload_action() -> anyhow::Result<()> {
 #[cfg(test)]
 mod runtime_config_tests {
     use super::*;
+
+    #[test]
+    fn unit_tests_use_an_isolated_config_directory() {
+        let config_dir = Config::get_dir().unwrap();
+        assert!(config_dir.starts_with(env::temp_dir()));
+        assert_ne!(
+            env::var_os("TACKY_BORDERS_CONFIG_HOME").map(PathBuf::from),
+            Some(config_dir)
+        );
+        assert_eq!(Config::read_contents().unwrap(), DEFAULT_CONFIG);
+    }
 
     fn rule(
         kind: Option<MatchKind>,

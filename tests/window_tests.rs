@@ -1,3 +1,6 @@
+#[path = "test_support.rs"]
+mod test_support;
+
 use serial_test::serial;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -832,6 +835,7 @@ fn animated_resource_stress_helper() -> anyhow::Result<()> {
         SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
     };
     anyhow::ensure!(std::env::var("FIX01_STRESS_CHILD")? == "1");
+    test_support::initialize();
     tacky_borders::register_border_window_class()?;
     let animations: AnimationsConfig = serde_json::from_value(serde_json::json!({
         "active": [{ "type": "Spiral" }], "inactive": [{ "type": "Spiral" }], "fps": 30, "enabled": true

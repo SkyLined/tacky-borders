@@ -1,3 +1,6 @@
+#[path = "test_support.rs"]
+mod test_support;
+
 use tacky_borders::border_config::BorderConfig;
 use tacky_borders::border_drawer::BorderDrawer;
 use tacky_borders::config::{OffsetConfig, RadiusConfig, WidthConfig};
@@ -8,6 +11,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 
 fn prepare_v2_render_backend() -> anyhow::Result<()> {
+    test_support::initialize();
     APP_STATE.update_config(|config| config.render_backend = RenderBackendConfig::V2)?;
     let render_factory = APP_STATE.get_render_factory();
     *APP_STATE.get_directx_devices_mut() = Some(DirectXDevices::new(render_factory)?);
@@ -17,6 +21,7 @@ fn prepare_v2_render_backend() -> anyhow::Result<()> {
 
 #[test]
 fn test_legacy_render_backend() -> anyhow::Result<()> {
+    test_support::initialize();
     register_border_window_class()?;
     let border = WindowBorder::new(HWND::default())?;
     let mut backend =
@@ -35,6 +40,7 @@ fn test_legacy_render_backend() -> anyhow::Result<()> {
 
 #[test]
 fn test_render_backend_v2_with_extra_bitmaps() -> anyhow::Result<()> {
+    test_support::initialize();
     register_border_window_class()?;
     let border = WindowBorder::new(HWND::default())?;
     let hwnd = border.border_window.0;
@@ -60,6 +66,7 @@ fn test_render_backend_v2_with_extra_bitmaps() -> anyhow::Result<()> {
 
 #[test]
 fn test_render_backend_v2_without_extra_bitmaps() -> anyhow::Result<()> {
+    test_support::initialize();
     register_border_window_class()?;
     let border = WindowBorder::new(HWND::default())?;
     let hwnd = border.border_window.0;
@@ -85,6 +92,7 @@ fn test_render_backend_v2_without_extra_bitmaps() -> anyhow::Result<()> {
 
 #[test]
 fn test_border_drawer_update() -> anyhow::Result<()> {
+    test_support::initialize();
     register_border_window_class()?;
     let border = WindowBorder::new(HWND::default())?;
     let hwnd = border.border_window.0;

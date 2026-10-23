@@ -3,6 +3,10 @@
     windows_subsystem = "windows"
 )]
 
+#[cfg(test)]
+#[path = "../tests/test_support.rs"]
+mod test_support;
+
 #[macro_use]
 extern crate log;
 extern crate sp_log;
@@ -758,6 +762,7 @@ mod host_tests {
     fn assert_host_shutdown(shutting_down: bool) {
         use tacky_borders::border_coordinator::BorderLifecycleCoordinator;
         use tacky_borders::border_registry::BorderRegistry;
+        test_support::initialize();
         let requests = REQUESTS.lock().unwrap();
         let hook_work = tacky_borders::event_hook::initialize_hook_pump().unwrap();
         let registry = std::sync::Arc::new(std::sync::Mutex::new(BorderRegistry::default()));
